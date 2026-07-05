@@ -33,26 +33,36 @@ function ioSlotPos(ioNode, slot) {
 }
 
 // --- link collection ---
-
-// Returns { entries, unresolved }. unresolved > 0 means some links can't
-// be routed — caller should fall back to the original renderer.
+// Returns { entries, ioUnresolved }. ioUnresolved counts links that
+// reference subgraph virtual IO nodes (-10/-20) we failed to resolve —
+// only those trigger a full fallback to the official renderer.
+// Links pointing at plain missing nodes (stale links after node
+// deletion, floating links with origin_id -1, etc.) are silently
+// skipped, matching the official renderer's behaviour — they must NOT
+// disable SmartEdge for the whole canvas.
 function collectLinks(graph) {
   const out = [];
-  let unresolved = 0;
+  let ioUnresolved = 0;
   const links = graph.links;
   const each = (link) => {
     if (!link) return;
     const a = resolveNode(graph, link.origin_id);
     const b = resolveNode(graph, link.target_id);
     if (!a || !b) {
-      unresolved++;
+      if (
+        link.origin_id === SUBGRAPH_INPUT_ID ||
+        link.origin_id === SUBGRAPH_OUTPUT_ID ||
+        link.target_id === SUBGRAPH_INPUT_ID ||
+        link.target_id === SUBGRAPH_OUTPUT_ID
+      )
+        ioUnresolved++;
       return;
     }
     out.push({ link, a, b });
   };
   if (links instanceof Map) for (const l of links.values()) each(l);
   else for (const id in links) each(links[id]);
-  return { entries: out, unresolved };
+  return { entries: out, ioUnresolved };
 }
 
 // --- endpoints ---
@@ -215,15 +225,27 @@ export function setCachedPath(cached, pts) {
 // --- main routing entry point ---
 
 export function routeAll(graph) {
-  const { entries, unresolved } = collectLinks(graph);
-  if (unresolved > 0) return null;
+  const { entries, ioUnresolved } = collectLinks(graph);
+  // Subgraph boundary links we can't resolve (frontend changed its
+  // virtual-node structure?) — fall back fully so those links stay
+  // visible via the official renderer. Plain stale/floating links are
+  // already skipped in collectLinks and never trigger this.
+  if (ioUnresolved > 0) return null;
   const dirty = refreshGraph(graph, entries);
   const dragging = M.settleTimer !== null;
 
   const results = [];
   for (const e of entries) {
     const ep = endpoints(e);
-    if (!ep) return null;
+    if (!ep) {
+      // subgraph IO link whose slot coords are unavailable -> full
+      // fallback; regular link with broken coords -> just skip it
+      const io =
+        e.link.origin_id === SUBGRAPH_INPUT_ID ||
+        e.link.target_id === SUBGRAPH_OUTPUT_ID;
+      if (io) return null;
+      continue;
+    }
     const endsKey =
       (ep.out.x | 0) + "," + (ep.out.y | 0) + "|" + (ep.inp.x | 0) + "," + (ep.inp.y | 0);
     let cached = M.pathCache.get(e.link.id);
