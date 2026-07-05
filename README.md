@@ -1,4 +1,4 @@
-# ComfyUI-LinkRouter ☕
+# ComfyUI-LinkRouter
 
 <a href="https://buymeacoffee.com/90red"><img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&amp;emoji=%E2%98%95&amp;slug=90red&amp;button_colour=FFDD00&amp;font_colour=000000&amp;font_family=Bree&amp;outline_colour=000000&amp;coffee_colour=ffffff" /></a>
 
@@ -14,7 +14,7 @@
 
 ## Features
 
-Links automatically route around nodes instead of through them. Smooth dragging with anti-flicker. Animated flow markers on hover or selection. Floating bar for quick toggles. Full settings panel. All pure frontend — zero impact on generation.
+Links automatically route around nodes instead of through them. Smooth dragging with anti-flicker. Animated flow markers on hover or selection. Floating bar for quick toggles. Full settings panel.
 
 ## Installation
 
