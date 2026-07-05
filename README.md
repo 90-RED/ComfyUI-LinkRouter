@@ -24,10 +24,6 @@
 
 ## Installation
 
-### ComfyUI Manager (recommended)
-Search `LinkRouter` and install.
-
-### Manual
 ```bash
 cd ComfyUI/custom_nodes/
 git clone https://github.com/90-RED/ComfyUI-LinkRouter
