@@ -14,13 +14,12 @@
 
 ## Features
 
-- 🔀 **Auto-detour** — links route around nodes instead of passing through them
-- 🖱️ **Smooth dragging** — anti-flicker stickiness keeps shapes stable while you drag
-- ✨ **Flow animation** — dots / pills / arrows / ovals / dashes on hover or selection
-- 🎯 **Highlight & dim** — selected node's links brighten, others fade to focus
-- 🎛️ **Floating bar** — quick toggles for routing, link style, flow mode, and settings
-- ⚙️ **Full settings panel** — everything adjustable with live preview
-- 🚀 **Zero performance cost** — pure browser canvas, no GPU/VRAM impact
+- 🔀 Links auto-detour around nodes
+- 🖱️ Anti-flicker while dragging
+- ✨ Flow animation on hover/select
+- 🎛️ Floating quick-toggle bar
+- ⚙️ Full settings panel
+- 🚀 Zero performance impact
 
 ## Installation
 
