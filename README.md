@@ -14,7 +14,7 @@
 
 ## Features
 
-Links automatically route around nodes instead of through them. Smooth dragging with anti-flicker. Animated flow markers on hover or selection. Floating bar for quick toggles. Full settings panel.
+Links automatically route around nodes instead of through them. Animated flow markers on hover or selection. Floating bar for quick toggles.
 
 ## Installation
 
@@ -31,9 +31,6 @@ LinkRouter is enabled by default. A floating bar appears on the right:
 | 🔀 | Toggle routing |
 | 🌊📐➖ | Cycle official link styles |
 | ✨➤◾ | Cycle flow markers (animated/static/none) |
-| ⚙️ | Open settings |
-| 🐞 | Debug overlay |
-| ✥ | Drag to move |
 
 All visual parameters are in **Settings → LinkRouter**.
 
