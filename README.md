@@ -1,6 +1,6 @@
 # ComfyUI-LinkRouter ☕
 
-[![Buy me a coffee](https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&emoji=☕&slug=90red&button_colour=FFDD00&font_colour=000000&font_family=Bree&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/90red)
+[![Buy me a coffee](https://img.shields.io/badge/Buy_me_a_coffee-☕-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/90red)
 
 > **I'm new to all this — first plugin, first GitHub repo, learning as I go.**
 > If you find bugs, have ideas, or just want to help a beginner out, I'd be incredibly grateful. 
