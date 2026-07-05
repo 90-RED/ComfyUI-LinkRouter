@@ -1,6 +1,6 @@
 # ComfyUI-LinkRouter ☕
 
-<script type="text/javascript" src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js" data-name="bmc-button" data-slug="90red" data-color="#FFDD00" data-emoji="☕"  data-font="Bree" data-text="Buy me a coffee" data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff" ></script>
+[![Buy me a coffee](https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&emoji=☕&slug=90red&button_colour=FFDD00&font_colour=000000&font_family=Bree&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/90red)
 
 > **I'm new to all this — first plugin, first GitHub repo, learning as I go.**
 > If you find bugs, have ideas, or just want to help a beginner out, I'd be incredibly grateful. 
