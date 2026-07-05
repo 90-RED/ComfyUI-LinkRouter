@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-linkrouter"
+version = "1.0.0"
+description = "Object-avoiding orthogonal link routing for ComfyUI — links automatically detour around nodes instead of passing through them."
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[tool.comfy]
+PublisherId = "90-RED"
+DisplayName = "ComfyUI-LinkRouter"
+Icon = ""
+
+[project.urls]
+Repository = "https://github.com/90-RED/ComfyUI-LinkRouter"
