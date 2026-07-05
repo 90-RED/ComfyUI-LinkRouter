@@ -10,7 +10,7 @@
 
 **Object-avoiding orthogonal link routing for ComfyUI.** Links automatically detour around nodes with smooth right-angle paths — no more spaghetti lines.
 
-![demo](screenshots/demo.gif)
+![Before vs After](screenshots/demo.jpg)
 
 ## Features
 
