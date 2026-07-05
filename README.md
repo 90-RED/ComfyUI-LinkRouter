@@ -1,6 +1,6 @@
 # ComfyUI-LinkRouter ☕
 
-<a href="https://buymeacoffee.com/90red"><img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&emoji=&slug=90red&button_colour=FFDD00&font_colour=000000&font_family=Bree&outline_colour=000000&coffee_colour=ffffff" /></a>
+<a href="https://buymeacoffee.com/90red"><img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&amp;emoji=%E2%98%95&amp;slug=90red&amp;button_colour=FFDD00&amp;font_colour=000000&amp;font_family=Bree&amp;outline_colour=000000&amp;coffee_colour=ffffff" /></a>
 
 > **I'm new to all this — first plugin, first GitHub repo, learning as I go.**
 > If you find bugs, have ideas, or just want to help a beginner out, I'd be incredibly grateful. 
