@@ -14,12 +14,7 @@
 
 ## Features
 
-- 🔀 Links auto-detour around nodes
-- 🖱️ Anti-flicker while dragging
-- ✨ Flow animation on hover/select
-- 🎛️ Floating quick-toggle bar
-- ⚙️ Full settings panel
-- 🚀 Zero performance impact
+Links automatically route around nodes instead of through them. Smooth dragging with anti-flicker. Animated flow markers on hover or selection. Floating bar for quick toggles. Full settings panel. All pure frontend — zero impact on generation.
 
 ## Installation
 
