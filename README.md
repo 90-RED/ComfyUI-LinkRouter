@@ -1,7 +1,9 @@
 # ComfyUI-LinkRouter
 
 <a href="https://buymeacoffee.com/90red" target="_blank">
-  <img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&amp;emoji=☕&amp;slug=90red&amp;button_colour=FFDD00&amp;font_colour=000000&amp;font_family=Bree&amp;outline_colour=000000" alt="Buy me a coffee" style="height: 60px !important;width: 200px !important;">
+  <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" 
+       alt="Buy Me A Coffee" 
+       style="height: 60px !important; width: 217px !important;">
 </a>
 
 > **I'm new to all this — first plugin, first GitHub repo, learning as I go.**
