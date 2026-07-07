@@ -208,11 +208,13 @@ function hoverNodeId(canvas) {
 export function drawAll(canvas, ctx) {
   const graph = canvas.graph;
   if (!graph) return;
+  // Guard: router not ready yet (settings may still be loading)
+  if (!M.router) return false;
   let routed;
   try {
     routed = routeAll(graph);
   } catch (err) {
-    console.warn("[LinkRouter] routing failed, falling back", err);
+    console.warn("[LinkRouter] routing failed, falling back", err?.message || err);
     M.S.enabled = false;
     return false;
   }
