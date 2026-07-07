@@ -67,6 +67,16 @@ function collectLinks(graph) {
 
 // --- endpoints ---
 
+// Try the Node 2.0-compatible API first (works in both legacy & Vue mode);
+// fall back to getConnectionPos on older ComfyUI builds.
+function getSlotPos(node, isInput, slotIndex) {
+  if (isInput && typeof node.getInputPos === "function")
+    return node.getInputPos(slotIndex);
+  if (!isInput && typeof node.getOutputPos === "function")
+    return node.getOutputPos(slotIndex);
+  return node.getConnectionPos(isInput, slotIndex, [0, 0]);
+}
+
 function endpoints(entry) {
   const { link, a, b } = entry;
   let p1 = null, p2 = null;
@@ -74,11 +84,11 @@ function endpoints(entry) {
     p1 =
       link.origin_id === SUBGRAPH_INPUT_ID
         ? ioSlotPos(a, link.origin_slot)
-        : a.getConnectionPos(false, link.origin_slot, [0, 0]);
+        : getSlotPos(a, false, link.origin_slot);
     p2 =
       link.target_id === SUBGRAPH_OUTPUT_ID
         ? ioSlotPos(b, link.target_slot)
-        : b.getConnectionPos(true, link.target_slot, [0, 0]);
+        : getSlotPos(b, true, link.target_slot);
   } catch {
     return null;
   }
@@ -125,7 +135,7 @@ function pathHitsRects(pts, rects) {
 function refreshGraph(graph, linkEntries) {
   const nodes = graph._nodes || [];
   const sig = layoutSignature(nodes);
-  if (sig === M.graphSig) return null;
+  if (sig === M.graphSig) return { _rects: null, _movedIds: new Set() };
 
   const mg = M.currentMargin();
   const ml = typeof mg === "number" ? mg : mg.l,
@@ -155,10 +165,12 @@ function refreshGraph(graph, linkEntries) {
   M.router.build(rawRects, terminals);
 
   const dirty = [];
+  const movedIds = new Set();
   for (const [id, rc] of newRects) {
     const o = M.prevRects.get(id);
     if (!o || o.x !== rc.x || o.y !== rc.y || o.x2 !== rc.x2 || o.y2 !== rc.y2) {
       dirty.push(rc);
+      movedIds.add(id);
       if (o) dirty.push(o);
     }
   }
@@ -170,13 +182,40 @@ function refreshGraph(graph, linkEntries) {
     if (M.settleTimer) clearTimeout(M.settleTimer);
     M.settleTimer = setTimeout(() => {
       M.settleTimer = null;
-      let hadSticky = false;
-      for (const c of M.pathCache.values())
-        if (c.sticky) { c.ends = null; hadSticky = true; }
-      if (hadSticky) app.canvas?.setDirty(true, true);
+      M._dragMovedIds = null;
+
+      if (M._lastDragMode === "hide-self") {
+        // Staggered reveal: 4 phases at 25% each → no lag spike
+        const frozen = [];
+        for (const c of M.pathCache.values())
+          if (c._frozen) frozen.push(c);
+        if (frozen.length > 0) {
+          const n = Math.ceil(frozen.length / 4);
+          for (let i = 0; i < 4; i++) {
+            const delay = i * 70; // 0, 70, 140, 210 ms
+            setTimeout(() => {
+              const a = i * n, b = Math.min(a + n, frozen.length);
+              for (let j = a; j < b; j++) {
+                frozen[j].ends = null;
+                delete frozen[j]._frozen;
+              }
+              app.canvas?.setDirty(true, true);
+            }, delay);
+          }
+          return;
+        }
+      }
+
+      // Normal clear (non mode-4)
+      let hadStale = false;
+      for (const c of M.pathCache.values()) {
+        if (c.sticky) { c.ends = null; hadStale = true; }
+        if (c._frozen) { c.ends = null; hadStale = true; delete c._frozen; }
+      }
+      if (hadStale) app.canvas?.setDirty(true, true);
     }, 180);
   }
-  return dirty;
+  return { _rects: dirty, _movedIds: movedIds };
 }
 
 // --- path stretch (drag anti-flicker) ---
@@ -226,20 +265,76 @@ export function setCachedPath(cached, pts) {
 
 export function routeAll(graph) {
   const { entries, ioUnresolved } = collectLinks(graph);
-  // Subgraph boundary links we can't resolve (frontend changed its
-  // virtual-node structure?) — fall back fully so those links stay
-  // visible via the official renderer. Plain stale/floating links are
-  // already skipped in collectLinks and never trigger this.
   if (ioUnresolved > 0) return null;
   const dirty = refreshGraph(graph, entries);
-  const dragging = M.settleTimer !== null;
+  const rawDragging = M.settleTimer !== null;
+  const dragMode = M.S.dragMode || "adaptive";
+
+  // Persist movedIds across frames within a drag session so hide/freeze
+  // doesn't flicker when graphSig hasn't changed on a given frame.
+  if (rawDragging && dirty._movedIds && dirty._movedIds.size > 0)
+    M._dragMovedIds = dirty._movedIds;
+  const movedIds = M._dragMovedIds || dirty._movedIds;
+
+  // Compute effectiveMode early (needed for mode-4 pause detection below)
+  let effectiveMode = dragMode;
+  if (effectiveMode === "adaptive" && movedIds && movedIds.size > 0) {
+    const draggedLinks = entries.filter((e) =>
+      movedIds.has(e.link.origin_id) || movedIds.has(e.link.target_id)
+    ).length;
+    if (draggedLinks <= 1)      effectiveMode = "none";
+    else if (draggedLinks <= 4) effectiveMode = "freeze-others";
+    else if (draggedLinks <= 10) effectiveMode = "freeze-others-strict";
+    else                         effectiveMode = "hide-self";
+  }
+  M._lastDragMode = effectiveMode;
+
+  // Mode 4: pointer held down (even paused) keeps links hidden.
+  const dragging = rawDragging ||
+    (effectiveMode === "hide-self" && M._pointerDown);
 
   const results = [];
+
   for (const e of entries) {
+    // --- drag behaviour ---
+    if (dragging && movedIds && movedIds.size > 0) {
+      const isDragged = movedIds.has(e.link.origin_id) ||
+                        movedIds.has(e.link.target_id);
+
+      if (effectiveMode === "hide-self") {
+        if (isDragged) continue;        // hide dragged links
+        // freeze others — use cached path if available
+        const cached = M.pathCache.get(e.link.id);
+        if (cached && cached.pts) {
+          cached._frozen = true;
+          results.push({ entry: e, cached });
+          continue;
+        }
+      }
+      if (effectiveMode === "freeze-others-strict" && !isDragged) {
+        const cached = M.pathCache.get(e.link.id);
+        if (cached && cached.pts) {
+          cached._frozen = true;
+          results.push({ entry: e, cached });
+          continue;
+        }
+      }
+      if (effectiveMode === "freeze-others" && !isDragged) {
+        const cached = M.pathCache.get(e.link.id);
+        if (cached && cached.pts) {
+          if (!pathHitsRects(cached.pts, dirty._rects)) {
+            cached._frozen = true;
+            results.push({ entry: e, cached });
+            continue;
+          }
+          // collision → fall through to full re-route
+        }
+      }
+      // "none" → fall through to normal routing
+    }
+
     const ep = endpoints(e);
     if (!ep) {
-      // subgraph IO link whose slot coords are unavailable -> full
-      // fallback; regular link with broken coords -> just skip it
       const io =
         e.link.origin_id === SUBGRAPH_INPUT_ID ||
         e.link.target_id === SUBGRAPH_OUTPUT_ID;
@@ -250,7 +345,7 @@ export function routeAll(graph) {
       (ep.out.x | 0) + "," + (ep.out.y | 0) + "|" + (ep.inp.x | 0) + "," + (ep.inp.y | 0);
     let cached = M.pathCache.get(e.link.id);
     const endsMoved = !cached || cached.ends !== endsKey;
-    const hitDirty = dirty && cached && cached.pts && pathHitsRects(cached.pts, dirty);
+    const hitDirty = dirty._rects && cached && cached.pts && pathHitsRects(cached.pts, dirty._rects);
 
     if (endsMoved || hitDirty) {
       let pts = null, sticky = false;

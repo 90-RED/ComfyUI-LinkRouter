@@ -44,6 +44,9 @@ export const M = {
   pathCache: new Map(),   // linkId -> {ends, pts, sticky, segs, total}
   bounding: new Float32Array(4),
   settleTimer: null,
+  _dragMovedIds: null,
+  _lastDragMode: "none",
+  _pointerDown: false,
 
   // --- animation state ---
   animActive: false,

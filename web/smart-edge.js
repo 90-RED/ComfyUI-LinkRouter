@@ -43,6 +43,9 @@ app.registerExtension({
     buildUI();
     watchHover();
     watchExecution();
+    // Track pointer state for mode-4 drag detection
+    document.addEventListener("pointerdown", () => { M._pointerDown = true; });
+    document.addEventListener("pointerup", () => { M._pointerDown = false; });
     const proto = LGraphCanvas.prototype;
     const original = proto.drawConnections;
     proto.drawConnections = function (ctx) {

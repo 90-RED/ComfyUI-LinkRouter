@@ -10,7 +10,6 @@ import { M } from "./state.js";
 const SETTINGS = {
   enabled: ["LinkRouter.General.Enabled", "Enable LinkRouter routing", "boolean", true],
   showButton: ["LinkRouter.General.FloatingBar", "Show floating button bar", "boolean", true],
-  showDebugButton: ["LinkRouter.General.ZDebugButton", "Show Debug button in floating bar", "boolean", false],
 
   marginMode: [
     "LinkRouter.Routing.ClearanceMode",
@@ -158,6 +157,21 @@ const SETTINGS = {
       { value: "on", text: "unchanged" },
     ],
   ],
+  dragMode: [
+    "LinkRouter.Routing.DragBehavior",
+    "Link behavior while dragging a node",
+    "combo",
+    "adaptive",
+    null,
+    [
+      { value: "none", text: "1 — normal (no change)" },
+      { value: "freeze-others", text: "2 — freeze others, re-route on collision" },
+      { value: "freeze-others-strict", text: "3 — freeze others, skip collision check" },
+      { value: "hide-self", text: "4 — freeze others, hide dragged links" },
+      { value: "adaptive", text: "5 — adaptive (auto-pick 1-4 by complexity, default)" },
+    ],
+  ],
+  showDebugButton: ["LinkRouter.View.ShowDebugButton", "Show Debug button in floating bar", "boolean", false],
 };
 
 // Fill S from defaults

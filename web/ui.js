@@ -40,6 +40,25 @@ function setOfficialLinkMode(v) {
   app.canvas?.setDirty(true, true);
 }
 
+// ---------------------------------------------------- drag mode
+
+const DRAG_MODES = [
+  { emoji: "🔓", name: "Normal",       value: "none" },
+  { emoji: "🧊", name: "Freeze+Check", value: "freeze-others" },
+  { emoji: "🥶", name: "Freeze",       value: "freeze-others-strict" },
+  { emoji: "👻", name: "Hide",         value: "hide-self" },
+  { emoji: "🧠", name: "Adaptive",     value: "adaptive" },
+];
+
+function cycleDragMode() {
+  const cur = M.S.dragMode || "adaptive";
+  const idx = DRAG_MODES.findIndex((m) => m.value === cur);
+  const next = DRAG_MODES[(idx + 1) % DRAG_MODES.length];
+  applySetting("dragMode", next.value);
+  try { app.ui.settings.setSettingValue(SETTINGS.dragMode[0], next.value); } catch {}
+  refreshBar();
+}
+
 // ---------------------------------------------------- settings dialog
 
 // Open ComfyUI settings, directly on the LinkRouter panel when possible.
@@ -87,6 +106,20 @@ function openSettings() {
 
 // ---------------------------------------------------- refresh bar
 
+function isVueNodesEnabled() {
+  return typeof LiteGraph !== "undefined" && LiteGraph.vueNodesMode === true;
+}
+
+function toggleVueNodes() {
+  try {
+    const next = !isVueNodesEnabled();
+    if (typeof LiteGraph !== "undefined") LiteGraph.vueNodesMode = next;
+    app.ui.settings.setSettingValue("Comfy.VueNodes.Enabled", next);
+    M.resetRouter();
+    app.canvas?.setDirty(true, true);
+  } catch {}
+}
+
 export function refreshBar() {
   if (!M.uiBox || !M.barRefs) return;
   M.uiBox.style.display = M.S.showButton ? "flex" : "none";
@@ -94,12 +127,25 @@ export function refreshBar() {
   const flowEmoji = { animated: "✨", static: "➤", none: "◾" };
   M.barRefs.anim.textContent = flowEmoji[M.S.flowMode] || "✨";
   M.barRefs.setActive(M.barRefs.anim, M.S.flowMode !== "none");
-  M.barRefs.anim.title = "Flow markers: " + M.S.flowMode + " (click to cycle)";
+  M.barRefs.anim.title =
+    ["animated", "static", "none"]
+      .map((v) => (v === M.S.flowMode ? "✨ " + v + " ◀" : "➤ " + v))
+      .join("\n");
+  M.barRefs.setActive(M.barRefs.vueToggle, isVueNodesEnabled());
+  M.barRefs.vueToggle.title = "2️⃣ Nodes 2.0: " + (isVueNodesEnabled() ? "ON" : "OFF");
+  M.barRefs.vueToggle.style.display = M.S.showDebugButton ? "" : "none";
+  const dragMode = M.S.dragMode || "adaptive";
+  const dragInfo = DRAG_MODES.find((m) => m.value === dragMode) || DRAG_MODES[4];
+  M.barRefs.dragBtn.textContent = dragInfo.emoji;
+  M.barRefs.dragBtn.title =
+    DRAG_MODES.map((d) => d.emoji + " " + d.name + (d.value === dragMode ? " ◀" : "")).join("\n");
   M.barRefs.setActive(M.barRefs.debug, M.barState.debug);
   M.barRefs.debug.style.display = M.S.showDebugButton ? "" : "none";
-  const m = LINK_MODES.find((m) => m.value === getOfficialLinkMode()) || LINK_MODES[0];
+  const linkCur = getOfficialLinkMode();
+  const m = LINK_MODES.find((l) => l.value === linkCur) || LINK_MODES[0];
   M.barRefs.linkMode.textContent = m.emoji;
-  M.barRefs.linkMode.title = "Official link style: " + m.name + " (click to cycle; used when LinkRouter is off)";
+  M.barRefs.linkMode.title =
+    LINK_MODES.map((l) => l.emoji + " " + l.name + (l.value === linkCur ? " ◀" : "")).join("\n");
 }
 
 // ---------------------------------------------------- build UI
@@ -110,8 +156,8 @@ export function buildUI() {
     "position:fixed;z-index:9999;display:flex;gap:6px;align-items:center;" +
     "background:rgba(30,30,30,.88);border:1px solid #555;border-radius:10px;" +
     "padding:6px 8px;user-select:none;";
-  const defX = Math.max(8, innerWidth - 340);
-  const defY = Math.max(8, Math.round(innerHeight * 0.38));
+  const defX = Math.max(8, Math.round(innerWidth * 0.5 - 100));
+  const defY = Math.max(8, Math.round(innerHeight * 0.35));
   box.style.left = (M.barState.btnX ?? defX) + "px";
   box.style.top = (M.barState.btnY ?? defY) + "px";
 
@@ -139,13 +185,15 @@ export function buildUI() {
     b.style.background = on ? "#2a6" : "#333";
   };
 
-  const toggle = mkBtn("🔀", "LinkRouter routing on/off");
-  const linkMode = mkBtn("🌊", "Official link style (used when LinkRouter is off)");
-  const anim = mkBtn("✨", "Flow markers: animated / static arrows / none");
-  const settingsBtn = mkBtn("⚙️", "Open ComfyUI settings");
-  const debug = mkBtn("🐞", "LinkRouter debug overlay");
-  const closeBtn = mkBtn("✖", "Hide this bar (re-enable in Settings > LinkRouter)");
-  const handle = mkBtn("✥", "Drag to move this bar");
+  const toggle     = mkBtn("🔀", "Route on/off");
+  const linkMode   = mkBtn("🌊", "Link style");
+  const anim       = mkBtn("✨", "Flow markers");
+  const dragBtn    = mkBtn("🧠", "Drag mode");
+  const settingsBtn = mkBtn("⚙️", "Settings");
+  const vueToggle  = mkBtn("2️⃣", "Nodes 2.0 on/off");
+  const debug      = mkBtn("🐞", "Debug overlay");
+  const closeBtn   = mkBtn("✖", "Hide bar");
+  const handle     = mkBtn("✥", "Move bar");
   handle.style.cursor = "grab";
   handle.style.background = "transparent";
   handle.style.border = "none";
@@ -182,9 +230,14 @@ export function buildUI() {
     refreshBar();
     app.canvas?.setDirty(true, true);
   };
+  vueToggle.onclick = () => {
+    toggleVueNodes();
+    refreshBar();
+  };
+  dragBtn.onclick = () => cycleDragMode();
 
-  box.append(toggle, linkMode, anim, settingsBtn, debug, closeBtn, handle);
-  M.barRefs = { toggle, linkMode, anim, debug, setActive };
+  box.append(toggle, linkMode, anim, dragBtn, settingsBtn, vueToggle, debug, closeBtn, handle);
+  M.barRefs = { toggle, linkMode, anim, vueToggle, dragBtn, debug, setActive };
 
   let drag = null;
   handle.addEventListener("pointerdown", (ev) => {
