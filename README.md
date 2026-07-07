@@ -33,11 +33,6 @@ LinkRouter is enabled by default. A floating bar appears on the right:
 | 🔀 | Toggle routing |
 | 🌊📐➖ | Cycle official link styles |
 | ✨➤◾ | Cycle flow markers (animated/static/none) |
-| 🧠🔓🧊🥶👻 | Cycle drag behavior (normal/freeze/hide/adaptive) |
-| ⚙️ | Open ComfyUI settings |
-| 2️⃣ | Toggle Nodes 2.0 mode |
-| 🐞 | Debug overlay (enable in Settings) |
-| ✖ | Hide floating bar |
 
 All visual parameters are in **Settings → LinkRouter**.
 
