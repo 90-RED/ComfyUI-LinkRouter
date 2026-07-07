@@ -321,7 +321,7 @@ export function routeAll(graph) {
       }
       if (effectiveMode === "freeze-others" && !isDragged) {
         const cached = M.pathCache.get(e.link.id);
-        if (cached && cached.pts) {
+        if (cached && cached.pts && dirty._rects) {
           if (!pathHitsRects(cached.pts, dirty._rects)) {
             cached._frozen = true;
             results.push({ entry: e, cached });
