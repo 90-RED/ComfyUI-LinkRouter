@@ -94,6 +94,13 @@ const SETTINGS = {
     0.06,
     { min: 0, max: 0.6, step: 0.02 },
   ],
+  dragDimAlpha: [
+    "LinkRouter.Highlight.DragDimOpacity",
+    "Unrelated links opacity while dragging (0 = same as dim)",
+    "slider",
+    0.15,
+    { min: 0, max: 0.6, step: 0.02 },
+  ],
 
   flowMode: [
     "LinkRouter.Marker Animation.Mode",
@@ -170,6 +177,13 @@ const SETTINGS = {
       { value: "hide-self", text: "4 — freeze others, hide dragged links" },
       { value: "adaptive", text: "5 — adaptive (auto-pick 1-4 by complexity, default)" },
     ],
+  ],
+  routeBatchPercent: [
+    "LinkRouter.Routing.RouteBatchPercent",
+    "Gradual reveal: % of links per frame (lower = smoother, higher = faster)",
+    "slider",
+    10,
+    { min: 2, max: 100, step: 1 },
   ],
   showDebugButton: ["LinkRouter.View.ShowDebugButton", "Show Debug button in floating bar", "boolean", false],
 };

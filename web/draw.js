@@ -224,6 +224,7 @@ export function drawAll(canvas, ctx) {
   const hovId = M.S.hoverAnim ? hoverNodeId(canvas) : null;
   const hoverId = hovId !== null && !selIds.has(hovId) ? hovId : null;
   const hasSel = M.S.selectHighlight && selIds.size > 0;
+  const isDragging = M.settleTimer !== null || M._pointerDown;
   const related = (link) => selIds.has(link.origin_id) || selIds.has(link.target_id);
   const hovered = (link) =>
     hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId);
@@ -241,7 +242,13 @@ export function drawAll(canvas, ctx) {
     const isSel = hasSel && related(link);
     const isHov = M.S.hoverAnim && hovered(link);
     let alpha = 1;
-    if (hasSel && !isSel) alpha = +M.S.dimAlpha;
+    if (hasSel && !isSel) {
+      // During drag, use a separate (less aggressive) dim value
+      // so you can still see the canvas layout while dragging.
+      alpha = isDragging && M.S.dragDimAlpha > 0
+        ? +M.S.dragDimAlpha
+        : +M.S.dimAlpha;
+    }
     if (alpha <= 0.01) continue;
 
     ctx.globalAlpha = alpha;

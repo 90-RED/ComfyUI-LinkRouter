@@ -178,6 +178,10 @@ function refreshGraph(graph, linkEntries) {
   M.prevRects = newRects;
   M.graphSig = sig;
 
+  // Drag-settle timer: persists _dragMovedIds during drag and handles
+  // staggered unfreeze (mode 4) or sticky-path cleanup on release.
+  // Bulk changes (workflow switch, undo) are detected downstream in
+  // routeAll via isBulkChange (>60% nodes moved) and skip drag logic.
   if (M.S.stickiness) {
     if (M.settleTimer) clearTimeout(M.settleTimer);
     M.settleTimer = setTimeout(() => {
@@ -185,16 +189,19 @@ function refreshGraph(graph, linkEntries) {
       M._dragMovedIds = null;
 
       if (M._lastDragMode === "hide-self") {
-        // Staggered reveal: 4 phases at 25% each → no lag spike
+        // Staggered reveal using routeBatchPercent setting.
+        // Lower % = more batches, smoother unfreeze.
         const frozen = [];
         for (const c of M.pathCache.values())
           if (c._frozen) frozen.push(c);
         if (frozen.length > 0) {
-          const n = Math.ceil(frozen.length / 4);
-          for (let i = 0; i < 4; i++) {
-            const delay = i * 70; // 0, 70, 140, 210 ms
+          const pct = Math.max(0.01, (+M.S.routeBatchPercent || 10) / 100);
+          const perBatch = Math.max(1, Math.ceil(frozen.length * pct));
+          const batches = Math.ceil(frozen.length / perBatch);
+          for (let i = 0; i < batches; i++) {
+            const delay = i * 70;
             setTimeout(() => {
-              const a = i * n, b = Math.min(a + n, frozen.length);
+              const a = i * perBatch, b = Math.min(a + perBatch, frozen.length);
               for (let j = a; j < b; j++) {
                 frozen[j].ends = null;
                 delete frozen[j]._frozen;
@@ -272,13 +279,19 @@ export function routeAll(graph) {
 
   // Persist movedIds across frames within a drag session so hide/freeze
   // doesn't flicker when graphSig hasn't changed on a given frame.
-  if (rawDragging && dirty._movedIds && dirty._movedIds.size > 0)
+  // BUT skip persistence for bulk changes (workflow switch, undo, etc.)
+  // where >60% of nodes moved in one frame — these are NOT user drags.
+  const nodes = graph._nodes || [];
+  const prevMoved = M._dragMovedIds || dirty._movedIds;
+  const isBulkChange = prevMoved && prevMoved.size > 0 &&
+    (prevMoved.size > nodes.length * 0.6 || prevMoved.size > 15);
+  if (rawDragging && dirty._movedIds && dirty._movedIds.size > 0 && !isBulkChange)
     M._dragMovedIds = dirty._movedIds;
   const movedIds = M._dragMovedIds || dirty._movedIds;
 
   // Compute effectiveMode early (needed for mode-4 pause detection below)
   let effectiveMode = dragMode;
-  if (effectiveMode === "adaptive" && movedIds && movedIds.size > 0) {
+  if (effectiveMode === "adaptive" && movedIds && movedIds.size > 0 && !isBulkChange) {
     const draggedLinks = entries.filter((e) =>
       movedIds.has(e.link.origin_id) || movedIds.has(e.link.target_id)
     ).length;
@@ -302,7 +315,13 @@ export function routeAll(graph) {
                         movedIds.has(e.link.target_id);
 
       if (effectiveMode === "hide-self") {
-        if (isDragged) continue;        // hide dragged links
+        if (isDragged) {
+          // Freeze dragged link so it participates in the staggered
+          // reveal after drag ends (settleTimer unfreeze batches).
+          const cached = M.pathCache.get(e.link.id);
+          if (cached && cached.pts) cached._frozen = true;
+          continue;
+        }
         // freeze others — use cached path if available
         const cached = M.pathCache.get(e.link.id);
         if (cached && cached.pts) {
