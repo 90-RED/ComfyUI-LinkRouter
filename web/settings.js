@@ -171,11 +171,12 @@ const SETTINGS = {
     "adaptive",
     null,
     [
+      { value: "adaptive", text: "Adaptive — automatic selection (default)" },
       { value: "none", text: "1 — normal (no change)" },
       { value: "freeze-others", text: "2 — freeze others, re-route on collision" },
       { value: "freeze-others-strict", text: "3 — freeze others, skip collision check" },
       { value: "hide-self", text: "4 — freeze others, hide dragged links" },
-      { value: "adaptive", text: "5 — adaptive (auto-pick 1-4 by complexity, default)" },
+      { value: "heavy-deferred", text: "5 — heavy deferred (hide and postpone routing while moving)" },
     ],
   ],
   routeBatchPercent: [
@@ -208,8 +209,13 @@ function applySetting(key, v) {
   if (M.ROUTER_KEYS.has(key)) M.resetRouter();
   else app.canvas?.setDirty(true, true);
   if ((key === "showButton" || key === "showDebugButton") && M.uiBox) maybeRefreshBar();
-  if (key === "showDebugButton" && !M.S.showDebugButton && M.barState.debug) {
+  if (
+    key === "showDebugButton" &&
+    !M.S.showDebugButton &&
+    (M.barState.debug || M.barState.debugPanel)
+  ) {
     M.barState.debug = false;
+    M.barState.debugPanel = false;
     M.saveBarState();
     app.canvas?.setDirty(true, true);
   }

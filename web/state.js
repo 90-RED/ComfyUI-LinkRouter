@@ -15,11 +15,27 @@ export const M = {
   barState: (() => {
     try {
       return Object.assign(
-        { debug: false, btnX: null, btnY: null },
+        {
+          debug: false,
+          debugPanel: false,
+          lastFlowMode: "animated",
+          lastCornerMode: "per-line",
+          lastManualDragMode: "freeze-others",
+          btnX: null,
+          btnY: null,
+        },
         JSON.parse(localStorage.getItem("linkrouter.state") || "{}"),
       );
     } catch {
-      return { debug: false, btnX: null, btnY: null };
+      return {
+        debug: false,
+        debugPanel: false,
+        lastFlowMode: "animated",
+        lastCornerMode: "per-line",
+        lastManualDragMode: "freeze-others",
+        btnX: null,
+        btnY: null,
+      };
     }
   })(),
   saveBarState() {
@@ -40,13 +56,35 @@ export const M = {
   // --- routing state ---
   router: null,
   graphSig: "",
+  routeFastSig: "",
+  routeGraph: null,
+  routeResults: null,
+  routeBatch: null,
+  routeBatchRaf: 0,
+  _deferredGraphBuild: false,
+  routeCostByLink: new Map(),
+  routeCostAverage: NaN,
   prevRects: new Map(),
   pathCache: new Map(),   // linkId -> {ends, pts, sticky, segs, total}
   bounding: new Float32Array(4),
   settleTimer: null,
   _dragMovedIds: null,
+  _dragAdaptiveMode: null,
+  _dragHeavyActive: null,
+  _dragLastFastSig: "",
+  _dragHiddenLinkIds: new Set(),
+  _dragAffectedLinkIds: new Set(),
+  _dragPauseActive: false,
+  _dragPausePending: false,
+  _dragPauseQueue: null,
+  _dragPauseCleanupLinkIds: new Set(),
+  _dragPauseAttemptedLinkIds: new Set(),
+  _dragPauseCompletedLinkIds: new Set(),
+  _dragInterruptedBatch: false,
+  _lastDragSettle: null,
   _lastDragMode: "none",
   _pointerDown: false,
+  _nodeDragActive: false,
 
   // --- animation state ---
   animActive: false,
@@ -58,17 +96,9 @@ export const M = {
 
   // --- floating bar DOM refs ---
   uiBox: null,   // DOM element
-  barRefs: null, // {toggle, linkMode, anim, debug, setActive}
+  barRefs: null, // floating-bar controls used by refreshBar()
 
   // --- pure helpers (depend only on M.S) ---
-
-  stubLen() {
-    const m =
-      this.S.marginMode === "uniform"
-        ? +this.S.margin || 16
-        : Math.max(+this.S.marginL || 16, +this.S.marginR || 16);
-    return m + 6;
-  },
 
   currentMargin() {
     if (this.S.marginMode === "uniform") return +this.S.margin || 16;
@@ -81,13 +111,39 @@ export const M = {
   },
 
   resetRouter() {
+    if (this.routeBatchRaf) {
+      const cancel = globalThis.cancelAnimationFrame || globalThis.clearTimeout;
+      cancel?.(this.routeBatchRaf);
+    }
     this.router = new OrthoRouter({
       margin: this.currentMargin(),
       bendPenalty: +this.S.bendPenalty || 40,
     });
     this.graphSig = "";
+    this.routeFastSig = "";
+    this.routeGraph = null;
+    this.routeResults = null;
+    this.routeBatch = null;
+    this.routeBatchRaf = 0;
+    this._deferredGraphBuild = false;
+    this.routeCostByLink.clear();
+    this.routeCostAverage = NaN;
     this.prevRects = new Map();
     this.pathCache.clear();
+    this._dragAdaptiveMode = null;
+    this._dragHeavyActive = null;
+    this._dragLastFastSig = "";
+    this._dragHiddenLinkIds.clear();
+    this._dragAffectedLinkIds.clear();
+    this._dragPauseActive = false;
+    this._dragPausePending = false;
+    this._dragPauseQueue = null;
+    this._dragPauseCleanupLinkIds.clear();
+    this._dragPauseAttemptedLinkIds.clear();
+    this._dragPauseCompletedLinkIds.clear();
+    this._dragInterruptedBatch = false;
+    this._lastDragSettle = null;
+    this._nodeDragActive = false;
     app.canvas?.setDirty(true, true);
   },
 

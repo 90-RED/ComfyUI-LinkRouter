@@ -3,6 +3,8 @@
 import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
 import { routeAll, nodeRect } from "./routing.js";
+import { profiler } from "./profiler.js";
+import { hoverDrawItems } from "./draw-policy.js";
 
 // --- color helpers ---
 
@@ -39,7 +41,8 @@ function darken(color, f = 0.3) {
 // --- path tracing ---
 
 function tracePath(ctx, pts) {
-  ctx.beginPath();
+  // CanvasRenderingContext2D needs beginPath(); Path2D has no such method.
+  if (typeof ctx.beginPath === "function") ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
   if (M.S.cornerMode === "off" || M.S.cornerRadius <= 0) {
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
@@ -69,6 +72,74 @@ function tracePath(ctx, pts) {
     ctx.arcTo(c.x, c.y, n.x, n.y, r);
   }
   ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+}
+
+function cachedCanvasPath(cached) {
+  if (typeof Path2D === "undefined") return null;
+  const key = M.S.cornerMode + "|" + M.S.cornerRadius;
+  if (cached._canvasPath && cached._canvasPathKey === key && cached._canvasPathPts === cached.pts)
+    return cached._canvasPath;
+  const path = new Path2D();
+  tracePath(path, cached.pts);
+  cached._canvasPath = path;
+  cached._canvasPathKey = key;
+  cached._canvasPathPts = cached.pts;
+  return path;
+}
+
+function strokeCachedPath(ctx, cached) {
+  const path = cachedCanvasPath(cached);
+  if (path) ctx.stroke(path);
+  else {
+    tracePath(ctx, cached.pts);
+    ctx.stroke();
+  }
+}
+
+let staticBatchCache = null;
+function staticBatches(canvas, routed) {
+  const profileStarted = profiler.active ? performance.now() : 0;
+  if (typeof Path2D === "undefined" || typeof Path2D.prototype.addPath !== "function") return null;
+  const colors = [];
+  let colorSig = "";
+  for (const { entry } of routed) {
+    const color = linkColor(canvas, entry.link);
+    colors.push(color);
+    colorSig += entry.link.id + ":" + color + ";";
+  }
+  const pathKey = M.S.cornerMode + "|" + M.S.cornerRadius;
+  if (
+    staticBatchCache?.routed === routed &&
+    staticBatchCache.pathKey === pathKey &&
+    staticBatchCache.colorSig === colorSig
+  ) {
+    if (profiler.active)
+      profiler.recordBatch({ hit: true, durationMs: Math.round((performance.now() - profileStarted) * 1000) / 1000 });
+    return staticBatchCache;
+  }
+
+  const all = new Path2D();
+  const byColor = new Map();
+  for (let i = 0; i < routed.length; i++) {
+    const { entry, cached } = routed[i];
+    const path = cachedCanvasPath(cached);
+    if (!path) return null;
+    all.addPath(path);
+    const color = colors[i];
+    let batch = byColor.get(color);
+    if (!batch) {
+      batch = new Path2D();
+      byColor.set(color, batch);
+    }
+    batch.addPath(path);
+    const pts = cached.pts;
+    const mid = pts[Math.floor(pts.length / 2)];
+    entry.link._pos && ((entry.link._pos[0] = mid.x), (entry.link._pos[1] = mid.y));
+  }
+  staticBatchCache = { routed, pathKey, colorSig, all, byColor };
+  if (profiler.active)
+    profiler.recordBatch({ hit: false, durationMs: Math.round((performance.now() - profileStarted) * 1000) / 1000 });
+  return staticBatchCache;
 }
 
 // --- marker shapes ---
@@ -119,15 +190,13 @@ function drawFlow(ctx, cached, t, baseColor, alpha, staticArrows = false) {
       ctx.lineWidth = size * 0.6 + (+M.S.animOutlineWidth || 2);
       ctx.setLineDash([size * 2, gap]);
       ctx.lineDashOffset = -((t * speed) % (size * 2 + gap));
-      tracePath(ctx, cached.pts);
-      ctx.stroke();
+      strokeCachedPath(ctx, cached);
     }
     ctx.strokeStyle = color;
     ctx.lineWidth = Math.max(1, size * 0.6);
     ctx.setLineDash([size * 2, gap]);
     ctx.lineDashOffset = -((t * speed) % (size * 2 + gap));
-    tracePath(ctx, cached.pts);
-    ctx.stroke();
+    strokeCachedPath(ctx, cached);
     ctx.restore();
     return;
   }
@@ -210,33 +279,59 @@ export function drawAll(canvas, ctx) {
   if (!graph) return;
   // Guard: router not ready yet (settings may still be loading)
   if (!M.router) return false;
+  const profileFrame = profiler.beginFrame(canvas);
   let routed;
   try {
     routed = routeAll(graph);
   } catch (err) {
     console.warn("[LinkRouter] routing failed, falling back", err?.message || err);
     M.S.enabled = false;
+    profiler.endFrame(profileFrame, { fallback: true });
     return false;
   }
-  if (routed === null) return false;
+  if (routed === null) {
+    profiler.endFrame(profileFrame, { fallback: true });
+    return false;
+  }
 
   const selIds = new Set(Object.keys(canvas.selected_nodes || {}).map(Number));
   const hovId = M.S.hoverAnim ? hoverNodeId(canvas) : null;
   const hoverId = hovId !== null && !selIds.has(hovId) ? hovId : null;
   const hasSel = M.S.selectHighlight && selIds.size > 0;
-  const isDragging = M.settleTimer !== null || M._pointerDown;
+  const isDragging = M._nodeDragActive;
   const related = (link) => selIds.has(link.origin_id) || selIds.has(link.target_id);
   const hovered = (link) =>
     hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId);
   const animOK = M.animEnabledNow();
 
   let animOn = false;
+  let strokeCalls = 0;
   const t = performance.now() / 1000;
 
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
-  for (const { entry, cached } of routed) {
+  // Hover must not switch the entire workflow from color batches to per-link
+  // drawing. Keep the unchanged batch as the base and overlay only links
+  // attached to the hovered node so they genuinely render on top.
+  const batches = !hasSel ? staticBatches(canvas, routed) : null;
+  const drawItems = hoverDrawItems(routed, hoverId, !!batches);
+  if (batches) {
+    const w = +M.S.lineWidth || 3;
+    if (M.S.outline) {
+      ctx.strokeStyle = `rgba(0,0,0,${+M.S.outlineAlpha || 0.5})`;
+      ctx.lineWidth = w + (+M.S.outlineWidth || 2);
+      ctx.stroke(batches.all);
+      strokeCalls++;
+    }
+    ctx.lineWidth = w;
+    for (const [color, path] of batches.byColor) {
+      ctx.strokeStyle = color;
+      ctx.stroke(path);
+      strokeCalls++;
+    }
+  }
+  for (const { entry, cached } of drawItems) {
     const pts = cached.pts;
     const link = entry.link;
     const isSel = hasSel && related(link);
@@ -258,13 +353,13 @@ export function drawAll(canvas, ctx) {
     if (M.S.outline) {
       ctx.strokeStyle = `rgba(0,0,0,${+M.S.outlineAlpha || 0.5})`;
       ctx.lineWidth = w + (+M.S.outlineWidth || 2);
-      tracePath(ctx, pts);
-      ctx.stroke();
+      strokeCachedPath(ctx, cached);
+      strokeCalls++;
     }
     ctx.strokeStyle = color;
     ctx.lineWidth = w;
-    tracePath(ctx, pts);
-    ctx.stroke();
+    strokeCachedPath(ctx, cached);
+    strokeCalls++;
 
     if ((isSel && M.S.selectAnim) || isHov) {
       if (M.S.flowMode === "animated" && animOK) {
@@ -292,5 +387,6 @@ export function drawAll(canvas, ctx) {
   ctx.restore();
 
   ensureAnimLoop(animOn);
+  profiler.endFrame(profileFrame, { links: routed.length, strokeCalls, batched: !!batches });
   return true;
 }

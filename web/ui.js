@@ -4,6 +4,12 @@ import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
 import { nodeRect } from "./routing.js";
 import { SETTINGS, applySetting } from "./settings.js";
+import { profiler } from "./profiler.js";
+import {
+  adaptiveToggleTarget,
+  FIXED_DRAG_MODES,
+  isFixedDragMode,
+} from "./ui-policy.js";
 
 // ---------------------------------------------------- link mode helpers
 
@@ -41,23 +47,6 @@ function setOfficialLinkMode(v) {
 }
 
 // ---------------------------------------------------- drag mode
-
-const DRAG_MODES = [
-  { emoji: "🔓", name: "Normal",       value: "none" },
-  { emoji: "🧊", name: "Freeze+Check", value: "freeze-others" },
-  { emoji: "🥶", name: "Freeze",       value: "freeze-others-strict" },
-  { emoji: "👻", name: "Hide",         value: "hide-self" },
-  { emoji: "🧠", name: "Adaptive",     value: "adaptive" },
-];
-
-function cycleDragMode() {
-  const cur = M.S.dragMode || "adaptive";
-  const idx = DRAG_MODES.findIndex((m) => m.value === cur);
-  const next = DRAG_MODES[(idx + 1) % DRAG_MODES.length];
-  applySetting("dragMode", next.value);
-  try { app.ui.settings.setSettingValue(SETTINGS.dragMode[0], next.value); } catch {}
-  refreshBar();
-}
 
 // ---------------------------------------------------- settings dialog
 
@@ -132,15 +121,42 @@ export function refreshBar() {
       .map((v) => (v === M.S.flowMode ? "✨ " + v + " ◀" : "➤ " + v))
       .join("\n");
   M.barRefs.setActive(M.barRefs.vueToggle, isVueNodesEnabled());
-  M.barRefs.vueToggle.title = "2️⃣ Nodes 2.0: " + (isVueNodesEnabled() ? "ON" : "OFF");
-  M.barRefs.vueToggle.style.display = M.S.showDebugButton ? "" : "none";
+  M.barRefs.vueToggle.title = "Nodes 2.0: " + (isVueNodesEnabled() ? "ON" : "OFF");
   const dragMode = M.S.dragMode || "adaptive";
-  const dragInfo = DRAG_MODES.find((m) => m.value === dragMode) || DRAG_MODES[4];
-  M.barRefs.dragBtn.textContent = dragInfo.emoji;
-  M.barRefs.dragBtn.title =
-    DRAG_MODES.map((d) => d.emoji + " " + d.name + (d.value === dragMode ? " ◀" : "")).join("\n");
-  M.barRefs.setActive(M.barRefs.debug, M.barState.debug);
+  const adaptiveOn = dragMode === "adaptive";
+  M.barRefs.dragBtn.textContent = "🧠";
+  M.barRefs.dragBtn.title = "Adaptive drag mode: " + (adaptiveOn ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.dragBtn, adaptiveOn);
+  M.barRefs.dragModeRow.style.display = adaptiveOn ? "none" : "flex";
+  for (const [value, button] of M.barRefs.dragModeButtons)
+    M.barRefs.setActive(button, value === dragMode);
+  const debugPanelOpen = M.S.showDebugButton && M.barState.debugPanel;
+  M.barRefs.setActive(M.barRefs.debug, debugPanelOpen);
   M.barRefs.debug.style.display = M.S.showDebugButton ? "" : "none";
+  M.barRefs.debug.title = debugPanelOpen ? "Close debug controls" : "Open debug controls";
+  M.barRefs.debugRow.style.display = debugPanelOpen ? "flex" : "none";
+  M.barRefs.setActive(M.barRefs.overlayBtn, M.barState.debug);
+  M.barRefs.overlayBtn.title = "Routing debug overlay: " + (M.barState.debug ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.flowBtn, M.S.flowMode !== "none");
+  M.barRefs.flowBtn.title = "Flow markers: " + (M.S.flowMode !== "none" ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.hoverBtn, M.S.hoverAnim);
+  M.barRefs.hoverBtn.title = "Hover animation: " + (M.S.hoverAnim ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.selectBtn, M.S.selectAnim);
+  M.barRefs.selectBtn.title = "Selection animation: " + (M.S.selectAnim ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.outlineBtn, M.S.outline);
+  M.barRefs.outlineBtn.title = "Line outline: " + (M.S.outline ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.cornerBtn, M.S.cornerMode !== "off");
+  M.barRefs.cornerBtn.title = "Rounded corners: " + (M.S.cornerMode !== "off" ? "ON" : "OFF");
+  M.barRefs.recordBtn.textContent = profiler.active ? "⏹" : "⏺";
+  M.barRefs.setActive(M.barRefs.recordBtn, profiler.active);
+  if (profiler.active) M.barRefs.recordBtn.style.background = "#b33";
+  M.barRefs.recordBtn.title = profiler.active
+    ? "Stop profiler now and save the report"
+    : "Record LinkRouter performance for 30 seconds";
+  M.barRefs.setActive(M.barRefs.copyBtn, !!profiler.lastReport);
+  M.barRefs.copyBtn.title = profiler.lastReport
+    ? "Copy the last profiler report"
+    : "No profiler report recorded yet";
   const linkCur = getOfficialLinkMode();
   const m = LINK_MODES.find((l) => l.value === linkCur) || LINK_MODES[0];
   M.barRefs.linkMode.textContent = m.emoji;
@@ -153,7 +169,7 @@ export function refreshBar() {
 export function buildUI() {
   const box = (M.uiBox = document.createElement("div"));
   box.style.cssText =
-    "position:fixed;z-index:9999;display:flex;gap:6px;align-items:center;" +
+    "position:fixed;z-index:9999;display:flex;flex-direction:column;gap:6px;align-items:stretch;" +
     "background:rgba(30,30,30,.88);border:1px solid #555;border-radius:10px;" +
     "padding:6px 8px;user-select:none;";
   const defX = Math.max(8, Math.round(innerWidth * 0.5 - 100));
@@ -185,15 +201,55 @@ export function buildUI() {
     b.style.background = on ? "#2a6" : "#333";
   };
 
+  const mainRow = document.createElement("div");
+  mainRow.style.cssText = "display:flex;gap:6px;align-items:center;";
+  const dragModeRow = document.createElement("div");
+  dragModeRow.style.cssText =
+    "display:none;gap:6px;align-items:center;padding-top:6px;border-top:1px solid #555;";
+  const debugRow = document.createElement("div");
+  debugRow.style.cssText =
+    "display:none;gap:6px;align-items:center;padding-top:6px;border-top:1px solid #555;";
+
+  const setPluginSetting = (key, value) => {
+    applySetting(key, value);
+    try { app.ui.settings.setSettingValue(SETTINGS[key][0], value); } catch {}
+    refreshBar();
+  };
+
   const toggle     = mkBtn("🔀", "Route on/off");
   const linkMode   = mkBtn("🌊", "Link style");
   const anim       = mkBtn("✨", "Flow markers");
   const dragBtn    = mkBtn("🧠", "Drag mode");
+  const dragModeButtons = new Map();
+  for (const mode of FIXED_DRAG_MODES) {
+    const button = mkBtn(mode.emoji, mode.name);
+    button.style.fontSize = "17px";
+    button.style.padding = "7px 9px";
+    button.onclick = () => {
+      M.barState.lastManualDragMode = mode.value;
+      M.saveBarState();
+      setPluginSetting("dragMode", mode.value);
+    };
+    dragModeButtons.set(mode.value, button);
+    dragModeRow.append(button);
+  }
   const settingsBtn = mkBtn("⚙️", "Settings");
-  const vueToggle  = mkBtn("2️⃣", "Nodes 2.0 on/off");
-  const debug      = mkBtn("🐞", "Debug overlay");
+  const debug      = mkBtn("🐞", "Open debug controls");
   const closeBtn   = mkBtn("✖", "Hide bar");
   const handle     = mkBtn("✥", "Move bar");
+  const overlayBtn = mkBtn("🟥", "Routing debug overlay");
+  const flowBtn    = mkBtn("✨", "Flow markers on/off");
+  const hoverBtn   = mkBtn("🖱️", "Hover animation on/off");
+  const selectBtn  = mkBtn("🎯", "Selection animation on/off");
+  const outlineBtn = mkBtn("◉", "Line outline on/off");
+  const cornerBtn  = mkBtn("◜", "Rounded corners on/off");
+  const vueToggle  = mkBtn("2️⃣", "Nodes 2.0 on/off");
+  const recordBtn  = mkBtn("⏺", "Record performance for 30 seconds");
+  const copyBtn    = mkBtn("📋", "Copy the last performance report");
+  for (const b of [overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, recordBtn, copyBtn]) {
+    b.style.fontSize = "16px";
+    b.style.padding = "7px 9px";
+  }
   handle.style.cursor = "grab";
   handle.style.background = "transparent";
   handle.style.border = "none";
@@ -225,19 +281,72 @@ export function buildUI() {
     openSettings();
   };
   debug.onclick = () => {
+    M.barState.debugPanel = !M.barState.debugPanel;
+    M.saveBarState();
+    refreshBar();
+  };
+  overlayBtn.onclick = () => {
     M.barState.debug = !M.barState.debug;
     M.saveBarState();
     refreshBar();
     app.canvas?.setDirty(true, true);
   };
+  flowBtn.onclick = () => {
+    if (M.S.flowMode === "none") {
+      setPluginSetting("flowMode", M.barState.lastFlowMode || "animated");
+    } else {
+      M.barState.lastFlowMode = M.S.flowMode;
+      M.saveBarState();
+      setPluginSetting("flowMode", "none");
+    }
+  };
+  hoverBtn.onclick = () => setPluginSetting("hoverAnim", !M.S.hoverAnim);
+  selectBtn.onclick = () => setPluginSetting("selectAnim", !M.S.selectAnim);
+  outlineBtn.onclick = () => setPluginSetting("outline", !M.S.outline);
+  cornerBtn.onclick = () => {
+    if (M.S.cornerMode === "off") {
+      setPluginSetting("cornerMode", M.barState.lastCornerMode || "per-line");
+    } else {
+      M.barState.lastCornerMode = M.S.cornerMode;
+      M.saveBarState();
+      setPluginSetting("cornerMode", "off");
+    }
+  };
   vueToggle.onclick = () => {
     toggleVueNodes();
     refreshBar();
   };
-  dragBtn.onclick = () => cycleDragMode();
+  recordBtn.onclick = () => {
+    if (profiler.active) profiler.stop("manual");
+    else profiler.start();
+    refreshBar();
+  };
+  copyBtn.onclick = async () => {
+    if (!(await profiler.copyLastReport())) return;
+    copyBtn.textContent = "✅";
+    setTimeout(() => refreshBar(), 1200);
+  };
+  dragBtn.onclick = () => {
+    const current = M.S.dragMode || "adaptive";
+    if (isFixedDragMode(current)) {
+      M.barState.lastManualDragMode = current;
+      M.saveBarState();
+    }
+    setPluginSetting(
+      "dragMode",
+      adaptiveToggleTarget(current, M.barState.lastManualDragMode),
+    );
+  };
 
-  box.append(toggle, linkMode, anim, dragBtn, settingsBtn, vueToggle, debug, closeBtn, handle);
-  M.barRefs = { toggle, linkMode, anim, vueToggle, dragBtn, debug, setActive };
+  mainRow.append(toggle, linkMode, anim, dragBtn, settingsBtn, debug, closeBtn, handle);
+  debugRow.append(overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, recordBtn, copyBtn);
+  box.append(mainRow, dragModeRow, debugRow);
+  M.barRefs = {
+    toggle, linkMode, anim, vueToggle, dragBtn, dragModeRow, dragModeButtons, debug, debugRow,
+    overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn,
+    recordBtn, copyBtn, setActive,
+  };
+  profiler.onChange = refreshBar;
 
   let drag = null;
   handle.addEventListener("pointerdown", (ev) => {

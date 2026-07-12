@@ -43,9 +43,33 @@ app.registerExtension({
     buildUI();
     watchHover();
     watchExecution();
-    // Track pointer state for mode-4 drag detection
-    document.addEventListener("pointerdown", () => { M._pointerDown = true; });
-    document.addEventListener("pointerup", () => { M._pointerDown = false; });
+    // Capture-phase tracking still sees gestures captured by Nodes 2.0.
+    const beginPointer = () => {
+      M._pointerDown = true;
+      M._nodeDragActive = false;
+      M._dragAdaptiveMode = null;
+      M._dragHeavyActive = null;
+      M._dragLastFastSig = M.routeFastSig || "";
+      M._dragHiddenLinkIds.clear();
+      M._dragAffectedLinkIds.clear();
+      M._dragPauseActive = false;
+      M._dragPausePending = false;
+      M._dragPauseQueue = null;
+      M._dragPauseCleanupLinkIds.clear();
+      M._dragPauseAttemptedLinkIds.clear();
+      M._dragPauseCompletedLinkIds.clear();
+      M._dragInterruptedBatch = false;
+    };
+    const releasePointer = () => { M._pointerDown = false; };
+    window.addEventListener("pointerdown", beginPointer, true);
+    window.addEventListener("pointermove", (ev) => {
+      // Pointer capture can occasionally hide the original down event from an
+      // extension, but the held-button state remains reliable.
+      if (ev.buttons & 1) M._pointerDown = true;
+    }, true);
+    window.addEventListener("pointerup", releasePointer, true);
+    window.addEventListener("pointercancel", releasePointer, true);
+    window.addEventListener("blur", releasePointer);
     const proto = LGraphCanvas.prototype;
     const original = proto.drawConnections;
     proto.drawConnections = function (ctx) {

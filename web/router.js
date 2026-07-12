@@ -130,6 +130,7 @@ export class OrthoRouter {
     this.vEdge = null; // Uint8Array nx*(ny-1)
     this.nx = 0;
     this.ny = 0;
+    this.overlapCache = new Map();
   }
 
   // Extra cost multiplier per tier (applied to segment length).
@@ -150,6 +151,7 @@ export class OrthoRouter {
       x2: r.x + r.w + mg.r,
       y2: r.y + r.h + mg.b,
     }));
+    this.overlapCache.clear();
 
     const xs = [],
       ys = [];
@@ -170,32 +172,68 @@ export class OrthoRouter {
     const hEdge = (this.hEdge = new Uint8Array(Math.max(0, ny * (nx - 1))));
     const vEdge = (this.vEdge = new Uint8Array(Math.max(0, nx * (ny - 1))));
 
-    // Tier of an edge = worst tier at its midpoint. Obstacle *edges*
-    // themselves stay tier-0 (that's the margin routing lane).
-    const tierAt = (px, py) => {
-      let t = 0;
-      for (let k = 0; k < this.rects.length; k++) {
-        const inf = this.rects[k];
-        if (inf.x < px && px < inf.x2 && inf.y < py && py < inf.y2) {
-          const raw = this.raw[k];
-          if (raw.x < px && px < raw.x2 && raw.y < py && py < raw.y2) return 2;
-          if (t < 1) t = 1;
-        }
-      }
-      return t;
-    };
-
+    // Tier of an edge = worst tier touched by its full open segment.
+    // Midpoint-only sampling can miss a short partial crossing of a body.
+    // Obstacle edges themselves remain legal routing lanes.
     for (let j = 0; j < ny; j++) {
       const y = this.ys[j];
       const row = j * (nx - 1);
-      for (let i = 0; i < nx - 1; i++)
-        hEdge[row + i] = tierAt((this.xs[i] + this.xs[i + 1]) / 2, y);
+      const active = [];
+      for (let k = 0; k < this.rects.length; k++) {
+        const r = this.rects[k];
+        if (y > r.y + EPS && y < r.y2 - EPS) active.push(k);
+      }
+      for (let i = 0; i < nx - 1; i++) {
+        const x1 = this.xs[i],
+          x2 = this.xs[i + 1];
+        let tier = 0;
+        for (const k of active) {
+          const inf = this.rects[k];
+          if (x2 <= inf.x + EPS || x1 >= inf.x2 - EPS) continue;
+          const raw = this.raw[k];
+          if (
+            y > raw.y + EPS &&
+            y < raw.y2 - EPS &&
+            x2 > raw.x + EPS &&
+            x1 < raw.x2 - EPS
+          ) {
+            tier = 2;
+            break;
+          }
+          tier = 1;
+        }
+        hEdge[row + i] = tier;
+      }
     }
     for (let i = 0; i < nx; i++) {
       const x = this.xs[i];
       const col = i * (ny - 1);
-      for (let j = 0; j < ny - 1; j++)
-        vEdge[col + j] = tierAt(x, (this.ys[j] + this.ys[j + 1]) / 2);
+      const active = [];
+      for (let k = 0; k < this.rects.length; k++) {
+        const r = this.rects[k];
+        if (x > r.x + EPS && x < r.x2 - EPS) active.push(k);
+      }
+      for (let j = 0; j < ny - 1; j++) {
+        const y1 = this.ys[j],
+          y2 = this.ys[j + 1];
+        let tier = 0;
+        for (const k of active) {
+          const inf = this.rects[k];
+          if (y2 <= inf.y + EPS || y1 >= inf.y2 - EPS) continue;
+          const raw = this.raw[k];
+          if (
+            x > raw.x + EPS &&
+            x < raw.x2 - EPS &&
+            y2 > raw.y + EPS &&
+            y1 < raw.y2 - EPS
+          ) {
+            tier = 2;
+            break;
+          }
+          tier = 1;
+        }
+        vEdge[col + j] = tier;
+      }
     }
   }
 
@@ -257,6 +295,10 @@ export class OrthoRouter {
           tier = vEdge[cur.i * (ny - 1) + cur.j - 1];
           nj = cur.j - 1;
         }
+        // Clearance zones are soft obstacles, but node bodies are hard
+        // obstacles.  A large finite penalty still lets A* cut through a
+        // node whenever the legal detour is sufficiently long.
+        if (tier === 2) continue;
         const len = Math.abs(xs[ni] - xs[cur.i]) + Math.abs(ys[nj] - ys[cur.j]);
         const g =
           cur.g + len + len * MULT[tier] + (nd === cur.d ? 0 : BP);
@@ -267,6 +309,224 @@ export class OrthoRouter {
       }
     }
     return null;
+  }
+
+  // Route a complete connector through the shortest viable combination of
+  // normal, vertical, direct-outward, and own-perimeter endpoint escapes.
+  routeConnector(out, bodyOut, frameOut, frameIn, bodyIn, inp) {
+    const sourceIndex = this._endpointRectIndex(bodyOut, frameOut, true);
+    const targetIndex = this._endpointRectIndex(bodyIn, frameIn, false);
+    const starts = this._frameEscapeCandidates(frameOut, sourceIndex, true);
+    const goals = this._frameEscapeCandidates(frameIn, targetIndex, false);
+    const pairs = [];
+    const endpointLegs =
+      Math.abs(out.x - frameOut.x) +
+      Math.abs(out.y - frameOut.y) +
+      Math.abs(frameIn.x - inp.x) +
+      Math.abs(frameIn.y - inp.y);
+    for (const start of starts)
+      for (const goal of goals)
+        pairs.push({
+          start,
+          goal,
+          escape: start.cost + goal.cost,
+          estimate:
+            endpointLegs +
+            start.cost +
+            Math.abs(start.point.x - goal.point.x) +
+            Math.abs(start.point.y - goal.point.y) +
+            goal.cost,
+        });
+    pairs.sort((a, b) => a.escape - b.escape || a.estimate - b.estimate);
+
+    // Endpoint escape legs are protected tunnels: they may pass through a
+    // node which physically overlaps the endpoint, but the A* middle section
+    // still treats every body as a hard obstacle.  Escape distance has
+    // priority; full routed length only breaks ties between equally short
+    // ways out of the overlap.
+    let winner = null,
+      winnerEscape = Infinity,
+      winnerLength = Infinity;
+    for (const { start, goal, escape } of pairs) {
+      if (winner && escape > winnerEscape + EPS) break;
+      const mid = this.route(start.point, start.dir, goal.point, goal.dir);
+      if (!mid) continue;
+      // Keep the two frame anchors even when the whole connector is straight.
+      // Drag stretching relies on these four endpoint points being present.
+      const path = dedupePoints([
+        out,
+        ...start.leg,
+        ...mid,
+        ...goal.leg.slice().reverse(),
+        inp,
+      ]);
+      const length = pathLength(path);
+      if (
+        escape < winnerEscape - EPS ||
+        (Math.abs(escape - winnerEscape) <= EPS && length < winnerLength)
+      ) {
+        winner = path;
+        winnerEscape = escape;
+        winnerLength = length;
+      }
+    }
+    if (winner) return winner;
+
+    // The clearance frame itself may be covered by a foreign node body.
+    // Retry from the endpoint nodes' raw body edges; those vertices can
+    // travel vertically along (but never through) their own body edges.
+    const mid = this.route(bodyOut, DIR.E, bodyIn, DIR.E);
+    if (mid) return dedupePoints([out, bodyOut, ...mid, bodyIn, inp]);
+    return null;
+  }
+
+  // Locate the endpoint's own obstacle so its clearance rectangle is not
+  // mistaken for a blocker.  Slot positions are on the raw right/left edge.
+  _endpointRectIndex(body, frame, isOutput) {
+    for (let i = 0; i < this.raw.length; i++) {
+      const raw = this.raw[i],
+        inf = this.rects[i];
+      const rawEdge = isOutput ? raw.x2 : raw.x;
+      const frameEdge = isOutput ? inf.x2 : inf.x;
+      if (
+        Math.abs(body.x - rawEdge) < EPS &&
+        Math.abs(frame.x - frameEdge) < EPS &&
+        body.y >= raw.y - EPS &&
+        body.y <= raw.y2 + EPS
+      )
+        return i;
+    }
+    return -1;
+  }
+
+  // Return normal, direct-outward, vertical, and own-perimeter escape
+  // candidates.  Protected perimeter tunnels are only created through raw
+  // node bodies connected to the endpoint's own body by actual overlap.
+  _frameEscapeCandidates(frame, ownIndex, isOutput) {
+    const normal = this._escapeCandidate([frame], isOutput);
+    if (ownIndex < 0) return [normal];
+    const overlap = this._rawOverlapSet(ownIndex);
+    // Clearance overlap is a soft routing cost, not an endpoint enclosure.
+    // Protected escape tunnels are only needed when raw node bodies overlap.
+    if (overlap.size <= 1) return [normal];
+    const intervals = [];
+    let blocked = false;
+    for (const i of overlap) {
+      if (i === ownIndex) continue;
+      const r = this.rects[i];
+      if (frame.x <= r.x + EPS || frame.x >= r.x2 - EPS) continue;
+      intervals.push([r.y, r.y2]);
+      if (frame.y > r.y + EPS && frame.y < r.y2 - EPS) blocked = true;
+    }
+    if (!blocked) return [normal];
+
+    let lo = frame.y,
+      hi = frame.y,
+      changed = true;
+    while (changed) {
+      changed = false;
+      for (const [a, b] of intervals) {
+        if (b < lo - EPS || a > hi + EPS) continue;
+        const nextLo = Math.min(lo, a),
+          nextHi = Math.max(hi, b);
+        if (nextLo < lo - EPS || nextHi > hi + EPS) {
+          lo = nextLo;
+          hi = nextHi;
+          changed = true;
+        }
+      }
+    }
+    const candidates = [
+      this._escapeCandidate([frame, { x: frame.x, y: lo }], isOutput),
+      this._escapeCandidate([frame, { x: frame.x, y: hi }], isOutput),
+    ];
+
+    const outward = isOutput ? 1 : -1;
+    const direct = this._horizontalOverlapExit(frame, ownIndex, overlap, outward);
+    if (Math.abs(direct.x - frame.x) > EPS)
+      candidates.push(this._escapeCandidate([frame, direct], isOutput));
+
+    const own = this.rects[ownIndex];
+    for (const y of [own.y, own.y2]) {
+      const corner = { x: frame.x, y };
+      const exit = this._horizontalOverlapExit(corner, ownIndex, overlap, -outward);
+      candidates.push(this._escapeCandidate([frame, corner, exit], isOutput));
+    }
+
+    const best = new Map();
+    for (const candidate of candidates) {
+      const p = candidate.point;
+      const key = Math.round(p.x * 2) + "," + Math.round(p.y * 2);
+      const old = best.get(key);
+      if (!old || candidate.cost < old.cost) best.set(key, candidate);
+    }
+    return [...best.values()];
+  }
+
+  _escapeCandidate(points, isOutput) {
+    const leg = dedupePoints(points);
+    const point = leg[leg.length - 1];
+    let dir = DIR.E;
+    if (leg.length > 1) {
+      const d = segmentDirection(leg[leg.length - 2], point);
+      dir = isOutput ? d : rev(d);
+    }
+    return { point, leg, cost: pathLength(leg), dir };
+  }
+
+  _rawOverlapSet(ownIndex) {
+    const cached = this.overlapCache.get(ownIndex);
+    if (cached) return cached;
+    const found = new Set([ownIndex]);
+    const queue = [ownIndex];
+    while (queue.length) {
+      const a = this.raw[queue.pop()];
+      for (let i = 0; i < this.raw.length; i++) {
+        if (found.has(i)) continue;
+        const b = this.raw[i];
+        if (
+          a.x < b.x2 - EPS &&
+          a.x2 > b.x + EPS &&
+          a.y < b.y2 - EPS &&
+          a.y2 > b.y + EPS
+        ) {
+          found.add(i);
+          queue.push(i);
+        }
+      }
+    }
+    this.overlapCache.set(ownIndex, found);
+    return found;
+  }
+
+  _horizontalOverlapExit(point, ownIndex, overlap, direction) {
+    const origin = point.x;
+    let edge = origin,
+      changed = true;
+    while (changed) {
+      changed = false;
+      for (const i of overlap) {
+        if (i === ownIndex) continue;
+        const raw = this.raw[i];
+        if (point.y <= raw.y + EPS || point.y >= raw.y2 - EPS) continue;
+        if (direction < 0) {
+          if (raw.x2 <= edge + EPS || raw.x >= origin - EPS) continue;
+          const next = Math.min(edge, this.rects[i].x);
+          if (next < edge - EPS) {
+            edge = next;
+            changed = true;
+          }
+        } else {
+          if (raw.x >= edge - EPS || raw.x2 <= origin + EPS) continue;
+          const next = Math.max(edge, this.rects[i].x2);
+          if (next > edge + EPS) {
+            edge = next;
+            changed = true;
+          }
+        }
+      }
+    }
+    return { x: edge, y: point.y };
   }
 
   debugInfo() {
@@ -299,4 +559,77 @@ export function simplify(pts) {
   }
   out.push(pts[pts.length - 1]);
   return out;
+}
+
+function dedupePoints(pts) {
+  const out = [];
+  for (const p of pts) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.x - p.x) < EPS && Math.abs(last.y - p.y) < EPS) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+// True only when an orthogonal segment enters a rectangle's open interior.
+// Travelling exactly along a node edge remains legal for endpoint escapes.
+function segmentCrossesRect(a, b, r) {
+  const minX = Math.min(a.x, b.x),
+    maxX = Math.max(a.x, b.x),
+    minY = Math.min(a.y, b.y),
+    maxY = Math.max(a.y, b.y);
+  if (Math.abs(a.y - b.y) < EPS)
+    return (
+      a.y > r.y + EPS &&
+      a.y < r.y2 - EPS &&
+      maxX > r.x + EPS &&
+      minX < r.x2 - EPS
+    );
+  if (Math.abs(a.x - b.x) < EPS)
+    return (
+      a.x > r.x + EPS &&
+      a.x < r.x2 - EPS &&
+      maxY > r.y + EPS &&
+      minY < r.y2 - EPS
+    );
+  // Router output should never be diagonal.  Treat one as unsafe rather
+  // than allowing an unverified path through a body.
+  return true;
+}
+
+export function pathCrossesRects(pts, rects) {
+  for (let i = 0; i < pts.length - 1; i++)
+    for (const r of rects)
+      if (segmentCrossesRect(pts[i], pts[i + 1], r)) return true;
+  return false;
+}
+
+// A stretched drag path may leave its source body on the first segment and
+// enter its target body on the last segment. Every other body intersection is
+// unsafe and must force a fresh route. This deliberately rejects sticky paths
+// in physically overlapped endpoint layouts; the full router owns those
+// protected escape-tunnel cases.
+export function stretchedPathCrossesUnexpectedNode(pts, rects, sourceIndex, targetIndex) {
+  for (let i = 0; i < pts.length - 1; i++) {
+    for (let j = 0; j < rects.length; j++) {
+      if (i === 0 && j === sourceIndex) continue;
+      if (i === pts.length - 2 && j === targetIndex) continue;
+      if (segmentCrossesRect(pts[i], pts[i + 1], rects[j])) return true;
+    }
+  }
+  return false;
+}
+
+function pathLength(pts) {
+  let total = 0;
+  for (let i = 0; i < pts.length - 1; i++)
+    total += Math.abs(pts[i + 1].x - pts[i].x) + Math.abs(pts[i + 1].y - pts[i].y);
+  return total;
+}
+
+function segmentDirection(a, b) {
+  if (b.x > a.x + EPS) return DIR.E;
+  if (b.x < a.x - EPS) return DIR.W;
+  if (b.y > a.y + EPS) return DIR.S;
+  return DIR.N;
 }
