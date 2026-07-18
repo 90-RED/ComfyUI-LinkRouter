@@ -45,6 +45,30 @@ function idxOf(arr, v) {
   return -1;
 }
 
+// First index with arr[idx] >= v (sorted ascending).
+function lowerBound(arr, v) {
+  let lo = 0,
+    hi = arr.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (arr[m] < v) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+
+// First index with arr[idx] > v (sorted ascending).
+function upperBound(arr, v) {
+  let lo = 0,
+    hi = arr.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (arr[m] <= v) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+
 // Directions from v toward goal, as a bitmask of DIR bits.
 function dirnsMask(vx, vy, gx, gy) {
   let m = 0;
@@ -131,6 +155,7 @@ export class OrthoRouter {
     this.nx = 0;
     this.ny = 0;
     this.overlapCache = new Map();
+    this._diff = null; // reusable Int32Array for difference-array build
   }
 
   // Extra cost multiplier per tier (applied to segment length).
@@ -175,64 +200,71 @@ export class OrthoRouter {
     // Tier of an edge = worst tier touched by its full open segment.
     // Midpoint-only sampling can miss a short partial crossing of a body.
     // Obstacle edges themselves remain legal routing lanes.
-    for (let j = 0; j < ny; j++) {
-      const y = this.ys[j];
-      const row = j * (nx - 1);
-      const active = [];
-      for (let k = 0; k < this.rects.length; k++) {
-        const r = this.rects[k];
-        if (y > r.y + EPS && y < r.y2 - EPS) active.push(k);
-      }
-      for (let i = 0; i < nx - 1; i++) {
-        const x1 = this.xs[i],
-          x2 = this.xs[i + 1];
-        let tier = 0;
-        for (const k of active) {
-          const inf = this.rects[k];
-          if (x2 <= inf.x + EPS || x1 >= inf.x2 - EPS) continue;
-          const raw = this.raw[k];
-          if (
-            y > raw.y + EPS &&
-            y < raw.y2 - EPS &&
-            x2 > raw.x + EPS &&
-            x1 < raw.x2 - EPS
-          ) {
-            tier = 2;
-            break;
-          }
-          tier = 1;
+    //
+    // Computed with 2D difference arrays over the compressed grid instead
+    // of scanning active rects per edge: each rect contributes +1/-1 over
+    // the strict-interior index ranges it covers, then a prefix sum yields
+    // per-edge coverage counts.  Two passes per orientation: raw bodies
+    // (tier 2), then inflated clearance frames (tier 1 where not already
+    // tier 2).  O(nx*ny + R log R) instead of O(nx*ny * activeRects);
+    // produces byte-identical results to the previous active-set scan.
+    this._stampTiers(hEdge, true);
+    this._stampTiers(vEdge, false);
+  }
+
+  // Fill `out` (Uint8Array) with edge tiers for one orientation.
+  // horizontal: out[j*(nx-1) + i], segment xs[i]..xs[i+1] at row ys[j].
+  // !horizontal: out[i*(ny-1) + j], segment ys[j]..ys[j+1] at column xs[i].
+  _stampTiers(out, horizontal) {
+    const { xs, ys, nx, ny } = this;
+    const segW = horizontal ? nx - 1 : ny - 1; // segments per line
+    const segH = horizontal ? ny : nx; // lines
+    const cells = segW * segH;
+    if (cells <= 0) return;
+    let diff = this._diff;
+    // Signed type required: decrement positions go negative before the
+    // prefix sum runs (unsigned would wrap and corrupt the counts).
+    if (!diff || diff.length < cells) diff = this._diff = new Int32Array(cells);
+    // pass 0: raw bodies -> tier 2; pass 1: inflated frames -> tier 1.
+    for (let pass = 0; pass < 2; pass++) {
+      const rects = pass === 0 ? this.raw : this.rects;
+      const tier = pass === 0 ? 2 : 1;
+      diff.fill(0, 0, cells);
+      for (let k = 0; k < rects.length; k++) {
+        const r = rects[k];
+        let lineLo, lineHi, segLo, segHi;
+        if (horizontal) {
+          // row strictly inside the rect's y-range:
+          //   ys[j] > r.y+EPS && ys[j] < r.y2-EPS
+          lineLo = upperBound(ys, r.y + EPS);
+          lineHi = lowerBound(ys, r.y2 - EPS);
+          // open segment strictly overlapping the rect's x-range:
+          //   xs[i+1] > r.x+EPS && xs[i] < r.x2-EPS
+          segLo = upperBound(xs, r.x + EPS) - 1;
+          segHi = lowerBound(xs, r.x2 - EPS);
+        } else {
+          // column strictly inside the rect's x-range
+          lineLo = upperBound(xs, r.x + EPS);
+          lineHi = lowerBound(xs, r.x2 - EPS);
+          // open segment strictly overlapping the rect's y-range
+          segLo = upperBound(ys, r.y + EPS) - 1;
+          segHi = lowerBound(ys, r.y2 - EPS);
         }
-        hEdge[row + i] = tier;
-      }
-    }
-    for (let i = 0; i < nx; i++) {
-      const x = this.xs[i];
-      const col = i * (ny - 1);
-      const active = [];
-      for (let k = 0; k < this.rects.length; k++) {
-        const r = this.rects[k];
-        if (x > r.x + EPS && x < r.x2 - EPS) active.push(k);
-      }
-      for (let j = 0; j < ny - 1; j++) {
-        const y1 = this.ys[j],
-          y2 = this.ys[j + 1];
-        let tier = 0;
-        for (const k of active) {
-          const inf = this.rects[k];
-          if (y2 <= inf.y + EPS || y1 >= inf.y2 - EPS) continue;
-          const raw = this.raw[k];
-          if (
-            x > raw.x + EPS &&
-            x < raw.x2 - EPS &&
-            y2 > raw.y + EPS &&
-            y1 < raw.y2 - EPS
-          ) {
-            tier = 2;
-            break;
-          }
-          tier = 1;
+        if (lineLo >= lineHi || segLo >= segHi) continue;
+        if (segLo < 0) segLo = 0;
+        for (let a = lineLo; a < lineHi; a++) {
+          const row = a * segW;
+          diff[row + segLo]++;
+          if (segHi < segW) diff[row + segHi]--;
         }
-        vEdge[col + j] = tier;
+      }
+      for (let a = 0; a < segH; a++) {
+        const row = a * segW;
+        let c = 0;
+        for (let b = 0; b < segW; b++) {
+          c += diff[row + b];
+          if (c > 0 && (tier === 2 || out[row + b] === 0)) out[row + b] = tier;
+        }
       }
     }
   }
@@ -240,10 +272,23 @@ export class OrthoRouter {
   // Route from a to b (both must have been passed as terminals to
   // build()). dirA = departure direction, dirB = required arrival
   // direction. Returns [{x, y}, ...] or null if unroutable.
-  route(a, dirA, b, dirB) {
+  //
+  // opts (all optional, defaults reproduce the historical exact search):
+  //   weight  — heuristic inflation (weighted A*). 1 = optimal; >1 is
+  //             bounded-suboptimal but several times faster on big graphs.
+  //   win     — {i0, i1, j0, j1} grid-index bounds; states outside the
+  //             window are never expanded (corridor search).
+  //   maxPops — safety valve on A* pops (default 60000).
+  // Side effects for diagnostics: this._lastPops / this._lastCost.
+  route(a, dirA, b, dirB, opts) {
+    this._lastPops = 0;
+    this._lastCost = Infinity;
     if (!this.hEdge) return null;
     const { xs, ys, nx, ny, hEdge, vEdge, bendPenalty: BP } = this;
     const MULT = OrthoRouter.TIER_MULT;
+    const weight = Math.max(1, opts?.weight || 1);
+    const win = opts?.win || null;
+    const maxPops = opts?.maxPops || 60000;
     const ia = idxOf(xs, a.x),
       ja = idxOf(ys, a.y);
     const ib = idxOf(xs, b.x),
@@ -256,9 +301,10 @@ export class OrthoRouter {
     const best = new Map(); // (i, j, dir) -> lowest g seen
     const skey = (i, j, d) => ((j * nx + i) << 2) | d;
     const heur = (i, j, d) =>
-      Math.abs(xs[i] - gx) +
-      Math.abs(ys[j] - gy) +
-      BP * estBends(d, xs[i], ys[j], gx, gy, dirB);
+      weight *
+      (Math.abs(xs[i] - gx) +
+        Math.abs(ys[j] - gy) +
+        BP * estBends(d, xs[i], ys[j], gx, gy, dirB));
 
     const start = { i: ia, j: ja, d: dirA, g: 0, f: heur(ia, ja, dirA), parent: null };
     open.push(start);
@@ -267,10 +313,17 @@ export class OrthoRouter {
     let pops = 0;
     while (open.size) {
       const cur = open.pop();
-      if (++pops > 60000) return null; // safety valve
+      if (++pops > maxPops) {
+        this._lastPops = pops;
+        return null; // safety valve
+      }
       const ck = skey(cur.i, cur.j, cur.d);
       if (cur.g > (best.get(ck) ?? Infinity)) continue; // stale entry
-      if (cur.i === ib && cur.j === jb) return reconstruct(cur, xs, ys);
+      if (cur.i === ib && cur.j === jb) {
+        this._lastPops = pops;
+        this._lastCost = cur.g;
+        return reconstruct(cur, xs, ys);
+      }
 
       // straight first, then right, then left (paper's deterministic
       // tie-break: slight preference for straighter, then right turns).
@@ -295,6 +348,9 @@ export class OrthoRouter {
           tier = vEdge[cur.i * (ny - 1) + cur.j - 1];
           nj = cur.j - 1;
         }
+        // Corridor window: never leave the search bounds.
+        if (win && (ni < win.i0 || ni > win.i1 || nj < win.j0 || nj > win.j1))
+          continue;
         // Clearance zones are soft obstacles, but node bodies are hard
         // obstacles.  A large finite penalty still lets A* cut through a
         // node whenever the legal detour is sufficiently long.
@@ -308,12 +364,27 @@ export class OrthoRouter {
         open.push({ i: ni, j: nj, d: nd, g, f: g + heur(ni, nj, nd), parent: cur });
       }
     }
+    this._lastPops = pops;
     return null;
   }
 
   // Route a complete connector through the shortest viable combination of
   // normal, vertical, direct-outward, and own-perimeter endpoint escapes.
-  routeConnector(out, bodyOut, frameOut, frameIn, bodyIn, inp) {
+  //
+  // opts.weight (default 1): heuristic inflation for the A* middle section.
+  // Interactive callers pass ~2.5 for responsiveness; the stable pass uses 1
+  // so settled paths remain optimal in the common case.
+  //
+  // Search strategy per escape pair (cheapest first):
+  //   0. simple 0/1-bend candidates with an exact optimality proof;
+  //   1. A* inside a corridor window around the terminals;
+  //   2. A* inside a larger window;
+  //   3. full-graph A* with weight >= 2.5 (last resort; previously these
+  //      links simply died on the 60k-pops valve and vanished).
+  // A windowed route whose cost exceeds 1.15x the global lower bound is
+  // rejected so the search escalates instead of accepting a long detour.
+  // Diagnostics land in this.lastStats = {pops, level, simple, weight}.
+  routeConnector(out, bodyOut, frameOut, frameIn, bodyIn, inp, opts) {
     const sourceIndex = this._endpointRectIndex(bodyOut, frameOut, true);
     const targetIndex = this._endpointRectIndex(bodyIn, frameIn, false);
     const starts = this._frameEscapeCandidates(frameOut, sourceIndex, true);
@@ -339,6 +410,72 @@ export class OrthoRouter {
         });
     pairs.sort((a, b) => a.escape - b.escape || a.estimate - b.estimate);
 
+    const weight = Math.max(1, opts?.weight || 1);
+    const stats = (this.lastStats = { pops: 0, level: 0, simple: 0, weight });
+    // Tests and diagnostics may disable the proven-optimal fast path.
+    const useSimple = opts?.simple !== false;
+
+    // Corridor window: bbox of every terminal, expanded by the larger of
+    // 4x margin or half the endpoint manhattan distance.
+    const bb = {
+      x0: Math.min(out.x, bodyOut.x, frameOut.x, frameIn.x, bodyIn.x, inp.x),
+      y0: Math.min(out.y, bodyOut.y, frameOut.y, frameIn.y, bodyIn.y, inp.y),
+      x1: Math.max(out.x, bodyOut.x, frameOut.x, frameIn.x, bodyIn.x, inp.x),
+      y1: Math.max(out.y, bodyOut.y, frameOut.y, frameIn.y, bodyIn.y, inp.y),
+    };
+    const mg = this.margin;
+    const mMax = typeof mg === "number" ? mg : Math.max(mg.l, mg.r, mg.t, mg.b);
+    const manh = Math.abs(out.x - inp.x) + Math.abs(out.y - inp.y);
+    const pad1 = Math.max(4 * mMax, 0.75 * manh);
+    const win0 = this._windowIndices(bb, pad1);
+    const winStates = (w) => 4 * (w.i1 - w.i0 + 1) * (w.j1 - w.j0 + 1);
+    const winPops = (ws) => Math.min(60000, Math.max(8000, 2 * ws));
+    const w0s = winStates(win0);
+    const fullStates = 4 * this.nx * this.ny;
+    const wFast = Math.max(weight, 2.5);
+    let levels;
+    let defaultBudget = 250000;
+    if (fullStates <= 2000000) {
+      // Small/medium graph: the plain exact search was never the lag
+      // problem here, so keep it — outcomes stay identical to the
+      // historical router, drag included. The new machinery below only
+      // engages where the exact search actually breaks down.
+      levels = [{ win: null, weight: 1, maxPops: 60000 }];
+      defaultBudget = Infinity;
+    } else if (pairs.length > 2) {
+      // Overlap-tangled connector: escape pairs multiply the search cost
+      // (each losing pair can burn a whole pops cap before the winning
+      // pair is reached). Exactness is already compromised by the overlap
+      // geometry, so every level goes weighted: failures fail fast and
+      // the winning pair resolves in a few thousand pops.
+      levels = [
+        { win: win0, weight: wFast, maxPops: 60000 },
+        { win: null, weight: wFast, maxPops: 150000 },
+      ];
+      defaultBudget = 400000;
+    } else if (w0s <= 250000 || w0s * 2 < fullStates) {
+      // Exact chain: the corridor is affordable or actually prunes the
+      // graph, so settled paths stay optimal for the common links.
+      const win1 = this._windowIndices(bb, pad1 * 2.5);
+      levels = [
+        { win: win0, weight, maxPops: winPops(w0s) },
+        { win: win1, weight, maxPops: winPops(winStates(win1)) },
+        { win: null, weight: wFast, maxPops: 150000 },
+      ];
+    } else {
+      // The corridor covers most of a huge graph: exact search there is
+      // the old 200ms+ disaster. Go weighted immediately; the window still
+      // prunes the far-flung regions.
+      levels = [
+        { win: win0, weight: wFast, maxPops: 100000 },
+        { win: null, weight: wFast, maxPops: 150000 },
+      ];
+    }
+    // Hard per-connector pops budget across every pair and level: a
+    // pathological link must degrade (negative cache + sticky path), never
+    // freeze the canvas for hundreds of milliseconds.
+    const popsBudget = opts?.popsBudget ?? defaultBudget;
+
     // Endpoint escape legs are protected tunnels: they may pass through a
     // node which physically overlaps the endpoint, but the A* middle section
     // still treats every body as a hard obstacle.  Escape distance has
@@ -347,36 +484,190 @@ export class OrthoRouter {
     let winner = null,
       winnerEscape = Infinity,
       winnerLength = Infinity;
-    for (const { start, goal, escape } of pairs) {
-      if (winner && escape > winnerEscape + EPS) break;
-      const mid = this.route(start.point, start.dir, goal.point, goal.dir);
-      if (!mid) continue;
-      // Keep the two frame anchors even when the whole connector is straight.
-      // Drag stretching relies on these four endpoint points being present.
-      const path = dedupePoints([
-        out,
-        ...start.leg,
-        ...mid,
-        ...goal.leg.slice().reverse(),
-        inp,
-      ]);
-      const length = pathLength(path);
-      if (
-        escape < winnerEscape - EPS ||
-        (Math.abs(escape - winnerEscape) <= EPS && length < winnerLength)
-      ) {
-        winner = path;
-        winnerEscape = escape;
-        winnerLength = length;
+    for (let lv = 0; lv < levels.length && !winner; lv++) {
+      const L = levels[lv];
+      for (const { start, goal, escape } of pairs) {
+        if (winner && escape > winnerEscape + EPS) break;
+        if (stats.pops >= popsBudget) break;
+        let mid = null;
+        if (lv === 0 && useSimple) {
+          mid = this._simpleMid(start, goal);
+          if (mid) stats.simple++;
+        }
+        if (!mid) {
+          mid = this.route(start.point, start.dir, goal.point, goal.dir, {
+            ...L,
+            maxPops: Math.min(L.maxPops, popsBudget - stats.pops),
+          });
+          stats.pops += this._lastPops;
+          if (!mid) continue;
+          // Escalation happens on failure only: a windowed path that looks
+          // expensive may simply have a loose lower bound (obstacle-forced
+          // detour), so cost alone must not discard it.
+        }
+        // Keep the two frame anchors even when the whole connector is straight.
+        // Drag stretching relies on these four endpoint points being present.
+        const path = dedupePoints([
+          out,
+          ...start.leg,
+          ...mid,
+          ...goal.leg.slice().reverse(),
+          inp,
+        ]);
+        const length = pathLength(path);
+        if (
+          escape < winnerEscape - EPS ||
+          (Math.abs(escape - winnerEscape) <= EPS && length < winnerLength)
+        ) {
+          winner = path;
+          winnerEscape = escape;
+          winnerLength = length;
+        }
       }
+      if (winner) stats.level = lv + 1;
     }
     if (winner) return winner;
 
     // The clearance frame itself may be covered by a foreign node body.
     // Retry from the endpoint nodes' raw body edges; those vertices can
     // travel vertically along (but never through) their own body edges.
-    const mid = this.route(bodyOut, DIR.E, bodyIn, DIR.E);
+    // This escape hatch gets its own dedicated pops allowance (the
+    // historical 60k valve): the pair loop above must not be able to
+    // starve it, or links the old router saved would newly vanish.
+    const mid = this.route(bodyOut, DIR.E, bodyIn, DIR.E, {
+      maxPops: 60000,
+    });
+    stats.pops += this._lastPops;
     if (mid) return dedupePoints([out, bodyOut, ...mid, bodyIn, inp]);
+    return null;
+  }
+
+  // Convert a pixel-space bbox + padding into inclusive grid-index bounds.
+  // Terminals passed to build() are always inside, so the range is never
+  // empty.
+  _windowIndices(bb, pad) {
+    const { xs, ys } = this;
+    return {
+      i0: Math.max(0, lowerBound(xs, bb.x0 - pad - EPS)),
+      i1: Math.min(xs.length - 1, upperBound(xs, bb.x1 + pad + EPS) - 1),
+      j0: Math.max(0, lowerBound(ys, bb.y0 - pad - EPS)),
+      j1: Math.min(ys.length - 1, upperBound(ys, bb.y1 + pad + EPS) - 1),
+    };
+  }
+
+  // Edge-by-edge cost of an axis-aligned grid segment, following the same
+  // tier pricing as the A* step. Returns null when a node body blocks it.
+  _walkSeg(i1, j1, i2, j2) {
+    const { xs, ys, nx, ny, hEdge, vEdge } = this;
+    const MULT = OrthoRouter.TIER_MULT;
+    let cost = 0;
+    if (j1 === j2) {
+      const row = j1 * (nx - 1);
+      const a = Math.min(i1, i2),
+        b = Math.max(i1, i2);
+      for (let i = a; i < b; i++) {
+        const t = hEdge[row + i];
+        if (t === 2) return null;
+        cost += (xs[i + 1] - xs[i]) * (1 + MULT[t]);
+      }
+    } else if (i1 === i2) {
+      const col = i1 * (ny - 1);
+      const a = Math.min(j1, j2),
+        b = Math.max(j1, j2);
+      for (let j = a; j < b; j++) {
+        const t = vEdge[col + j];
+        if (t === 2) return null;
+        cost += (ys[j + 1] - ys[j]) * (1 + MULT[t]);
+      }
+    } else return null;
+    return cost;
+  }
+
+  // Global lower bound for a mid-section: manhattan distance plus the
+  // cheapest bend estimate over all arrival directions (arrival direction
+  // is a soft preference, so the bound must minimise over it).
+  _midLB(start, goal) {
+    const S = start.point,
+      G = goal.point;
+    let minB = Infinity;
+    for (let gd = 0; gd < 4; gd++)
+      minB = Math.min(minB, estBends(start.dir, S.x, S.y, G.x, G.y, gd));
+    return (
+      Math.abs(S.x - G.x) + Math.abs(S.y - G.y) + this.bendPenalty * minB
+    );
+  }
+
+  // Fast path: try the straight and the two L-shaped mid-sections. A
+  // candidate whose exact cost matches the global lower bound is provably
+  // optimal, so A* can be skipped entirely. Returns the path (and sets
+  // _lastCost) or null to fall through to the search.
+  _simpleMid(start, goal) {
+    const { xs, ys, bendPenalty: BP } = this;
+    const S = start.point,
+      G = goal.point;
+    const is = idxOf(xs, S.x),
+      js = idxOf(ys, S.y);
+    const ig = idxOf(xs, G.x),
+      jg = idxOf(ys, G.y);
+    if (is < 0 || js < 0 || ig < 0 || jg < 0) return null;
+    const cands = [];
+    if (is === ig || js === jg)
+      cands.push([
+        { i: is, j: js },
+        { i: ig, j: jg },
+      ]);
+    else {
+      cands.push([
+        { i: is, j: js },
+        { i: ig, j: js },
+        { i: ig, j: jg },
+      ]);
+      cands.push([
+        { i: is, j: js },
+        { i: is, j: jg },
+        { i: ig, j: jg },
+      ]);
+    }
+    let bestPts = null,
+      bestCost = Infinity,
+      tied = false;
+    for (const c of cands) {
+      let cost = 0,
+        ok = true,
+        prevDir = start.dir;
+      for (let k = 0; k < c.length - 1 && ok; k++) {
+        const a = c[k],
+          b = c[k + 1];
+        if (a.i === b.i && a.j === b.j) continue; // degenerate zero-length
+        const seg = this._walkSeg(a.i, a.j, b.i, b.j);
+        if (seg === null) {
+          ok = false;
+          break;
+        }
+        const d =
+          a.j === b.j ? (b.i > a.i ? DIR.E : DIR.W) : b.j > a.j ? DIR.S : DIR.N;
+        cost += seg + (d === prevDir ? 0 : BP);
+        prevDir = d;
+      }
+      if (!ok) continue;
+      if (cost < bestCost - EPS) {
+        bestCost = cost;
+        bestPts = c.map((p) => ({ x: xs[p.i], y: ys[p.j] }));
+        tied = false;
+      } else if (cost <= bestCost + EPS) {
+        // An equal-cost alternative exists; let A*'s deterministic
+        // tie-break pick the shape instead of guessing here.
+        tied = true;
+      }
+    }
+    // The optimality proof must be strict: EPS-level slack would accept a
+    // candidate marginally worse than a path A* would have found, changing
+    // the settled shape. Only a candidate that truly reaches the lower
+    // bound (up to float noise) may bypass the search.
+    if (bestPts && !tied && bestCost <= this._midLB(start, goal) + 1e-6) {
+      this._lastCost = bestCost;
+      return bestPts;
+    }
     return null;
   }
 

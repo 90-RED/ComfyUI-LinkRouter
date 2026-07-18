@@ -106,6 +106,9 @@ class LinkRouterProfiler {
     this._lagTimer = null;
     this._observer = null;
     this._currentFrame = null;
+    this.saving = false;
+    this.lastSaveOk = null;
+    this.lastSavedFile = null;
   }
 
   loadLastReport() {
@@ -128,7 +131,10 @@ class LinkRouterProfiler {
       lastViewport: null,
       maxEventLoopDelayMs: 0,
     };
-    this._timer = setTimeout(() => this.stop("automatic-30s"), durationMs);
+    this._timer = setTimeout(
+      () => this.stop("automatic-" + Math.round(durationMs / 1000) + "s"),
+      durationMs,
+    );
     let expected = clock() + 100;
     this._lagTimer = setInterval(() => {
       const now = clock();
@@ -160,7 +166,33 @@ class LinkRouterProfiler {
     console.info("[LinkRouter Profiler] recording complete", this.lastReport);
     this.session = null;
     this.onChange?.();
+    this.saveLastReport(); // fire-and-forget: backend writes it to .disabled/LinkRouter_log
     return this.lastReport;
+  }
+
+  // Browser JS cannot write files: the companion POST endpoint in
+  // __init__.py persists every report to custom_nodes/.disabled/LinkRouter_log.
+  async saveLastReport() {
+    if (!this.lastReport) return false;
+    this.saving = true;
+    this.onChange?.();
+    let ok = false;
+    try {
+      const res = await fetch("/linkrouter/write_log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.lastReport),
+      });
+      const data = await res.json().catch(() => null);
+      ok = !!(res.ok && data?.ok);
+      if (ok && data?.file) this.lastSavedFile = data.file;
+    } catch {}
+    this.saving = false;
+    this.lastSaveOk = ok;
+    if (!ok)
+      console.warn("[LinkRouter Profiler] log save failed — restart ComfyUI so the backend endpoint loads?");
+    this.onChange?.();
+    return ok;
   }
 
   addEvent(event) {

@@ -164,6 +164,12 @@ const SETTINGS = {
       { value: "on", text: "unchanged" },
     ],
   ],
+  animOverlay: [
+    "LinkRouter.Marker Animation.OverlayLayer",
+    "Overlay animation layer (faster; markers draw above nodes)",
+    "boolean",
+    true,
+  ],
   dragMode: [
     "LinkRouter.Routing.DragBehavior",
     "Link behavior while dragging a node",
@@ -185,6 +191,24 @@ const SETTINGS = {
     "slider",
     10,
     { min: 2, max: 100, step: 1 },
+  ],
+  workerRouting: [
+    "LinkRouter.Routing.WorkerRouting",
+    "Background worker routing (large batches off the main thread)",
+    "boolean",
+    true,
+  ],
+  workerHeldPause: [
+    "LinkRouter.Routing.WorkerHeldPause",
+    "Held-pause re-routes in background worker (smoother drag pauses)",
+    "boolean",
+    true,
+  ],
+  adaptiveEscalation: [
+    "LinkRouter.Routing.AdaptiveEscalation",
+    "Adaptive drag: escalate mode when measured frame cost is high",
+    "boolean",
+    true,
   ],
   showDebugButton: ["LinkRouter.View.ShowDebugButton", "Show Debug button in floating bar", "boolean", false],
 };

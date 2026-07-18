@@ -195,7 +195,12 @@ test("upper/lower escape selection uses completed route length", () => {
     return [start, { x: goal.x, y: start.y }, goal];
   };
 
-  const path = router.routeConnector(out, out, frameOut, frameIn, inp, inp);
+  // The simple-path fast lane computes from real tiers and would bypass
+  // this stubbed route(); disable it so the test exercises the A* layer's
+  // escape-pair selection exactly as before.
+  const path = router.routeConnector(out, out, frameOut, frameIn, inp, inp, {
+    simple: false,
+  });
   assert.ok(path.some((p) => p.x === frameOut.x && p.y === 96));
   assert.equal(routeCalls, 2, "second candidate is checked only because it can still be shorter");
 });

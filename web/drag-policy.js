@@ -75,6 +75,28 @@ function distanceFromViewport(bounds, viewport) {
   return dx + dy;
 }
 
+// Worker-computed held-pause paths are revealed the very next frame after
+// arrival, all at once. Pacing made sense when compute lived on the main
+// thread (the one-by-one appearance doubled as progress feedback), but the
+// worker now delivers in clumps spread across the whole pause — measured
+// pauses last ~100-130ms while 17 paced reveals need another ~280ms, so the
+// tail links were discarded on resume without ever showing. A reveal is only
+// a couple of Map writes and can never stall the main thread, so the whole
+// pending queue drains in a single frame.
+export function pauseRevealCount(remaining) {
+  if (!(remaining > 0)) return 0;
+  return remaining;
+}
+
+// Held-pause race: while the worker chews through the whole pause queue,
+// the main thread may immediately route links predicted to be cheap, so
+// short pauses get the old one-by-one feedback. Unknown links use the
+// session-average fallback (usually cheap) — a mis-predicted link costs one
+// frame at most, and its true cost is learned for next time.
+export function shouldRacePauseLink(costMs, fallbackMs, maxMs) {
+  return (costMs === undefined ? fallbackMs : costMs) < maxMs;
+}
+
 // Freeze this order when a held pause begins: direct links first, then links
 // visible in the current viewport, then off-screen links expanding outward.
 export function orderHeldRouteCandidates(candidates, viewport) {

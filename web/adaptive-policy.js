@@ -123,6 +123,16 @@ export function escalateDragModeAfterFrame(currentMode, connectorMs, activeLinks
   return modeAtRank(rank);
 }
 
+// Mid-gesture escalation may only raise the presentation level, never lower
+// it: re-showing self links halfway through the same drag would flicker.
+// escalateDragModeAfterFrame alone can also downgrade (e.g. hide-self back to
+// freeze-others when the active set shrinks); this wrapper filters that out.
+export function escalateLockedDragMode(lockedMode, connectorMs, activeLinks = Infinity) {
+  if (!lockedMode || lockedMode === "adaptive") return lockedMode;
+  const next = escalateDragModeAfterFrame(lockedMode, connectorMs, activeLinks);
+  return DRAG_MODE_RANK[next] > DRAG_MODE_RANK[lockedMode] ? next : lockedMode;
+}
+
 export function shouldInvalidateAfterDrag(flags, collidesWithFinalNode) {
   return !!(
     flags?.affected ||

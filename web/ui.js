@@ -7,6 +7,8 @@ import { SETTINGS, applySetting } from "./settings.js";
 import { profiler } from "./profiler.js";
 import {
   adaptiveToggleTarget,
+  barLeftFor,
+  barStoredXFor,
   FIXED_DRAG_MODES,
   isFixedDragMode,
 } from "./ui-policy.js";
@@ -122,6 +124,17 @@ export function refreshBar() {
       .join("\n");
   M.barRefs.setActive(M.barRefs.vueToggle, isVueNodesEnabled());
   M.barRefs.vueToggle.title = "Nodes 2.0: " + (isVueNodesEnabled() ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.workerBtn, !!M.S.workerRouting && !M._workerFailed);
+  M.barRefs.workerBtn.title = M._workerFailed
+    ? "Worker routing: unavailable (using main thread)"
+    : "Worker routing: " + (M.S.workerRouting ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.pauseWorkerBtn, !!M.S.workerHeldPause && !M._workerFailed);
+  M.barRefs.pauseWorkerBtn.title = M._workerFailed
+    ? "Held-pause worker: unavailable (using main thread)"
+    : "Held-pause worker routing: " + (M.S.workerHeldPause ? "ON" : "OFF");
+  M.barRefs.setActive(M.barRefs.escalateBtn, M.S.adaptiveEscalation !== false);
+  M.barRefs.escalateBtn.title =
+    "Adaptive measured-lag escalation: " + (M.S.adaptiveEscalation !== false ? "ON" : "OFF");
   const dragMode = M.S.dragMode || "adaptive";
   const adaptiveOn = dragMode === "adaptive";
   M.barRefs.dragBtn.textContent = "🧠";
@@ -150,18 +163,45 @@ export function refreshBar() {
   M.barRefs.recordBtn.textContent = profiler.active ? "⏹" : "⏺";
   M.barRefs.setActive(M.barRefs.recordBtn, profiler.active);
   if (profiler.active) M.barRefs.recordBtn.style.background = "#b33";
+  const recordSecs = M.barState.recordSeconds || 30;
   M.barRefs.recordBtn.title = profiler.active
-    ? "Stop profiler now and save the report"
-    : "Record LinkRouter performance for 30 seconds";
-  M.barRefs.setActive(M.barRefs.copyBtn, !!profiler.lastReport);
-  M.barRefs.copyBtn.title = profiler.lastReport
-    ? "Copy the last profiler report"
-    : "No profiler report recorded yet";
+    ? "Stop now and save the report to LinkRouter_log"
+    : "Record LinkRouter performance for " + recordSecs + "s (auto-saves to LinkRouter_log)";
+  // Duration cycler (was the copy button): reports auto-save on every stop.
+  M.barRefs.durBtn.textContent = recordSecs + "s";
+  M.barRefs.setActive(M.barRefs.durBtn, true);
+  M.barRefs.durBtn.title =
+    "Profiler duration: " + recordSecs + "s — click to cycle 15 / 30 / 45\n" +
+    (profiler.saving
+      ? "Saving report…"
+      : profiler.lastSaveOk === false
+        ? "⚠ Last save FAILED — restart ComfyUI so the backend endpoint loads"
+        : profiler.lastSavedFile
+          ? "Last saved: LinkRouter_log/" + profiler.lastSavedFile
+          : "Reports auto-save to custom_nodes/.disabled/LinkRouter_log");
   const linkCur = getOfficialLinkMode();
   const m = LINK_MODES.find((l) => l.value === linkCur) || LINK_MODES[0];
   M.barRefs.linkMode.textContent = m.emoji;
   M.barRefs.linkMode.title =
     LINK_MODES.map((l) => l.emoji + " " + l.name + (l.value === linkCur ? " ◀" : "")).join("\n");
+  // Grow leftward: anchor the collapsed bar's right edge so opening a wider
+  // row (drag modes / debug controls) extends the box to the left instead of
+  // pushing its right edge across the canvas. baseW is re-measured whenever
+  // every extra row is hidden; btnX stays the collapsed-basis left edge
+  // (adopt the build-time position once if it was never stored).
+  const box = M.uiBox;
+  const rowsHidden =
+    M.barRefs.dragModeRow.style.display === "none" &&
+    M.barRefs.debugRow.style.display === "none";
+  if (M.barState.btnX == null && box.offsetWidth > 0)
+    M.barState.btnX = parseFloat(box.style.left) || 0;
+  if (rowsHidden) {
+    if (box.offsetWidth > 0) M._barBaseW = box.offsetWidth;
+    if (M.barState.btnX != null) box.style.left = M.barState.btnX + "px";
+  } else {
+    const baseW = M._barBaseW || box.offsetWidth;
+    box.style.left = barLeftFor(M.barState.btnX ?? 0, baseW, box.offsetWidth) + "px";
+  }
 }
 
 // ---------------------------------------------------- build UI
@@ -201,14 +241,17 @@ export function buildUI() {
     b.style.background = on ? "#2a6" : "#333";
   };
 
+  // Rows right-align their buttons (justify-content:flex-end): when a wider
+  // row opens and the box grows leftward (barLeftFor), the top row's buttons
+  // stay pinned to the anchored right edge instead of travelling left.
   const mainRow = document.createElement("div");
-  mainRow.style.cssText = "display:flex;gap:6px;align-items:center;";
+  mainRow.style.cssText = "display:flex;gap:6px;align-items:center;justify-content:flex-end;";
   const dragModeRow = document.createElement("div");
   dragModeRow.style.cssText =
-    "display:none;gap:6px;align-items:center;padding-top:6px;border-top:1px solid #555;";
+    "display:none;gap:6px;align-items:center;justify-content:flex-end;padding-top:6px;border-top:1px solid #555;";
   const debugRow = document.createElement("div");
   debugRow.style.cssText =
-    "display:none;gap:6px;align-items:center;padding-top:6px;border-top:1px solid #555;";
+    "display:none;gap:6px;align-items:center;justify-content:flex-end;padding-top:6px;border-top:1px solid #555;";
 
   const setPluginSetting = (key, value) => {
     applySetting(key, value);
@@ -244,9 +287,12 @@ export function buildUI() {
   const outlineBtn = mkBtn("◉", "Line outline on/off");
   const cornerBtn  = mkBtn("◜", "Rounded corners on/off");
   const vueToggle  = mkBtn("2️⃣", "Nodes 2.0 on/off");
-  const recordBtn  = mkBtn("⏺", "Record performance for 30 seconds");
-  const copyBtn    = mkBtn("📋", "Copy the last performance report");
-  for (const b of [overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, recordBtn, copyBtn]) {
+  const workerBtn  = mkBtn("🧵", "Background worker routing on/off");
+  const pauseWorkerBtn = mkBtn("✋", "Held-pause worker routing on/off");
+  const escalateBtn = mkBtn("📈", "Adaptive measured-lag escalation on/off");
+  const recordBtn  = mkBtn("⏺", "Record performance");
+  const durBtn     = mkBtn((M.barState.recordSeconds || 30) + "s", "Profiler duration: click to cycle 15 / 30 / 45 seconds");
+  for (const b of [overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn]) {
     b.style.fontSize = "16px";
     b.style.padding = "7px 9px";
   }
@@ -316,15 +362,20 @@ export function buildUI() {
     toggleVueNodes();
     refreshBar();
   };
+  workerBtn.onclick = () => setPluginSetting("workerRouting", !M.S.workerRouting);
+  pauseWorkerBtn.onclick = () => setPluginSetting("workerHeldPause", !M.S.workerHeldPause);
+  escalateBtn.onclick = () => setPluginSetting("adaptiveEscalation", M.S.adaptiveEscalation === false);
   recordBtn.onclick = () => {
     if (profiler.active) profiler.stop("manual");
-    else profiler.start();
+    else profiler.start((M.barState.recordSeconds || 30) * 1000);
     refreshBar();
   };
-  copyBtn.onclick = async () => {
-    if (!(await profiler.copyLastReport())) return;
-    copyBtn.textContent = "✅";
-    setTimeout(() => refreshBar(), 1200);
+  durBtn.onclick = () => {
+    const order = [15, 30, 45];
+    const cur = M.barState.recordSeconds || 30;
+    M.barState.recordSeconds = order[(order.indexOf(cur) + 1) % order.length];
+    M.saveBarState();
+    refreshBar();
   };
   dragBtn.onclick = () => {
     const current = M.S.dragMode || "adaptive";
@@ -339,12 +390,12 @@ export function buildUI() {
   };
 
   mainRow.append(toggle, linkMode, anim, dragBtn, settingsBtn, debug, closeBtn, handle);
-  debugRow.append(overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, recordBtn, copyBtn);
+  debugRow.append(overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn);
   box.append(mainRow, dragModeRow, debugRow);
   M.barRefs = {
-    toggle, linkMode, anim, vueToggle, dragBtn, dragModeRow, dragModeButtons, debug, debugRow,
+    toggle, linkMode, anim, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, dragBtn, dragModeRow, dragModeButtons, debug, debugRow,
     overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn,
-    recordBtn, copyBtn, setActive,
+    recordBtn, durBtn, setActive,
   };
   profiler.onChange = refreshBar;
 
@@ -357,10 +408,14 @@ export function buildUI() {
   });
   handle.addEventListener("pointermove", (ev) => {
     if (!drag) return;
-    M.barState.btnX = Math.max(0, Math.min(innerWidth - 60, ev.clientX - drag.dx));
-    M.barState.btnY = Math.max(0, Math.min(innerHeight - 30, ev.clientY - drag.dy));
-    box.style.left = M.barState.btnX + "px";
-    box.style.top = M.barState.btnY + "px";
+    const rawX = Math.max(0, Math.min(innerWidth - 60, ev.clientX - drag.dx));
+    const rawY = Math.max(0, Math.min(innerHeight - 30, ev.clientY - drag.dy));
+    // The box tracks the pointer directly; barState stores the collapsed-
+    // basis position so the left-growth anchor in refreshBar keeps holding.
+    M.barState.btnX = barStoredXFor(rawX, M._barBaseW || box.offsetWidth, box.offsetWidth);
+    M.barState.btnY = rawY;
+    box.style.left = rawX + "px";
+    box.style.top = rawY + "px";
   });
   handle.addEventListener("pointerup", (ev) => {
     if (!drag) return;

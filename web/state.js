@@ -21,6 +21,7 @@ export const M = {
           lastFlowMode: "animated",
           lastCornerMode: "per-line",
           lastManualDragMode: "freeze-others",
+          recordSeconds: 30,
           btnX: null,
           btnY: null,
         },
@@ -33,6 +34,7 @@ export const M = {
         lastFlowMode: "animated",
         lastCornerMode: "per-line",
         lastManualDragMode: "freeze-others",
+        recordSeconds: 30,
         btnX: null,
         btnY: null,
       };
@@ -63,9 +65,11 @@ export const M = {
   routeBatchRaf: 0,
   _deferredGraphBuild: false,
   routeCostByLink: new Map(),
+  routeCostByLinkMT: new Map(), // main-thread-measured costs only (pause race gate)
   routeCostAverage: NaN,
   prevRects: new Map(),
   pathCache: new Map(),   // linkId -> {ends, pts, sticky, segs, total}
+  failedRoutes: new Map(), // linkId -> {ends, fails, retryAt, bounds}
   bounding: new Float32Array(4),
   settleTimer: null,
   _dragMovedIds: null,
@@ -80,6 +84,7 @@ export const M = {
   _dragPauseCleanupLinkIds: new Set(),
   _dragPauseAttemptedLinkIds: new Set(),
   _dragPauseCompletedLinkIds: new Set(),
+  _dragPauseRevealQueue: [], // [{linkId, cached}] worker-computed, awaiting per-frame reveal
   _dragInterruptedBatch: false,
   _lastDragSettle: null,
   _lastDragMode: "none",
@@ -90,6 +95,19 @@ export const M = {
   animActive: false,
   rafId: 0,
   lastFrame: 0,
+
+  // --- overlay animation layer ---
+  _animLinks: [], // [{cached, color, alpha}] rebuilt by each drawAll
+  _overlayCanvas: null,
+  _overlayCtx: null,
+  _overlayFailed: false,
+  _overlayLoop: false,
+
+  // --- router worker (Phase D) ---
+  _worker: null,      // Worker instance (owned by worker-client.js)
+  _workerFailed: false,
+  _workerJobRev: 0,   // bumped on every dispatch/cancel; stale results die
+  _dragPauseWorker: null, // { jobRev, jobsById } held-pause queue dispatched to worker
 
   // --- hover tracking ---
   mouseClient: null, // {x, y} in client space
@@ -127,9 +145,11 @@ export const M = {
     this.routeBatchRaf = 0;
     this._deferredGraphBuild = false;
     this.routeCostByLink.clear();
+    this.routeCostByLinkMT.clear();
     this.routeCostAverage = NaN;
     this.prevRects = new Map();
     this.pathCache.clear();
+    this.failedRoutes.clear();
     this._dragAdaptiveMode = null;
     this._dragHeavyActive = null;
     this._dragLastFastSig = "";
@@ -141,9 +161,18 @@ export const M = {
     this._dragPauseCleanupLinkIds.clear();
     this._dragPauseAttemptedLinkIds.clear();
     this._dragPauseCompletedLinkIds.clear();
+    this._dragPauseRevealQueue.length = 0;
+    this._dragPauseWorker = null;
     this._dragInterruptedBatch = false;
     this._lastDragSettle = null;
     this._nodeDragActive = false;
+    this._animLinks.length = 0;
+    // Orphan any in-flight worker batch: bump the rev so its results are
+    // discarded, and tell the worker to stop (worker-client owns the object).
+    this._workerJobRev++;
+    try {
+      this._worker?.postMessage({ type: "cancel" });
+    } catch {}
     app.canvas?.setDirty(true, true);
   },
 

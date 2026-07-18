@@ -6,18 +6,21 @@
 
 import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
-import { pathCrossesRects, stretchedPathCrossesUnexpectedNode } from "./router.js";
+import { stretchPathPure } from "./stretch.js";
 import { profiler } from "./profiler.js";
 import {
   orderHeldRouteCandidates,
   pathBounds,
+  pauseRevealCount,
   shouldFreezeHiddenModeLink,
   shouldQueueIdleCleanup,
+  shouldRacePauseLink,
   shouldRouteHeldCollision,
   shouldStretchDragPath,
   shouldUseDragSettle,
 } from "./drag-policy.js";
 import {
+  escalateLockedDragMode,
   liveCollisionBudget,
   lockAdaptiveDragMode,
   shouldDeferHeavyGraphBuild,
@@ -31,6 +34,12 @@ import {
   progressiveItemLimit,
   shouldProgressivelyRoute,
 } from "./progressive.js";
+import {
+  cancelWorkerBatch,
+  dispatchWorkerBatch,
+  initWorkerClient,
+  workerRoutingUsable,
+} from "./worker-client.js";
 
 // Subgraph boundary IO virtual node ids (ComfyUI frontend convention).
 const SUBGRAPH_INPUT_ID = -10;
@@ -154,40 +163,62 @@ function endpoints(entry, rectCache) {
 
 // --- layout signature ---
 
+// Order-sensitive 52-bit rolling hash (two 26-bit lanes) used for change
+// detection only.  Replaces the previous per-frame string concatenation,
+// which allocated tens of KB of garbage every frame on large workflows.
+function sigStep(h, v) {
+  h.a = Math.imul(h.a ^ v, 16777619);
+  h.b = Math.imul(h.b ^ v, 3347671);
+}
+function sigDone(h) {
+  return (h.a & 0x3ffffff) * 67108864 + (h.b & 0x3ffffff);
+}
+
 function layoutSignature(nodes, rectCache) {
-  let s = "";
+  const h = { a: 0x811c9dc5, b: 0x01000193 };
   for (const n of nodes) {
     const r = cachedNodeRect(n, rectCache);
-    s += n.id + ":" + (r.x | 0) + "," + (r.y | 0) + "," + (r.w | 0) + "," + (r.h | 0) + ";";
+    sigStep(h, n.id | 0);
+    sigStep(h, r.x | 0);
+    sigStep(h, r.y | 0);
+    sigStep(h, r.w | 0);
+    sigStep(h, r.h | 0);
   }
-  return s;
+  return sigDone(h);
 }
 
 // Repaint-only frames should not collect every slot and rebuild the route
 // result array when the workflow geometry has not changed.
 function fastGraphSignature(graph, canvas) {
   const nodes = graph._nodes || [];
-  let s = "n" + nodes.length + ":";
+  const h = { a: 0x811c9dc5, b: 0x01000193 };
+  sigStep(h, nodes.length);
   for (const n of nodes) {
     const p = n.pos || [0, 0];
     const z = n.size || [0, 0];
-    s +=
-      n.id + "," + (p[0] | 0) + "," + (p[1] | 0) + "," +
-      (z[0] | 0) + "," + (z[1] | 0) + "," +
-      (n.flags?.collapsed ? 1 : 0) + "," +
-      (n.inputs?.length || 0) + "," + (n.outputs?.length || 0) + ";";
+    sigStep(h, n.id | 0);
+    sigStep(h, p[0] | 0);
+    sigStep(h, p[1] | 0);
+    sigStep(h, z[0] | 0);
+    sigStep(h, z[1] | 0);
+    sigStep(h, n.flags?.collapsed ? 1 : 0);
+    sigStep(h, (n.inputs?.length || 0) | 0);
+    sigStep(h, (n.outputs?.length || 0) | 0);
   }
   const links = graph.links;
   let count = 0;
   const add = (l) => {
     if (!l) return;
     count++;
-    s +=
-      l.id + "," + l.origin_id + "," + l.origin_slot + "," +
-      l.target_id + "," + l.target_slot + ";";
+    sigStep(h, l.id | 0);
+    sigStep(h, l.origin_id | 0);
+    sigStep(h, l.origin_slot | 0);
+    sigStep(h, l.target_id | 0);
+    sigStep(h, l.target_slot | 0);
   };
   if (links instanceof Map) for (const l of links.values()) add(l);
   else for (const id in links) add(links[id]);
+  sigStep(h, count);
 
   // Nodes 2.0 moves selected nodes through its layout store before (and in
   // some builds without) synchronising node.pos. Track the live bounding box
@@ -201,15 +232,17 @@ function fastGraphSignature(graph, canvas) {
   for (const node of values) if (node?.id != null) liveNodes.set(node.id, node);
   const resizing = canvas?.resizing_node;
   if (resizing?.id != null) liveNodes.set(resizing.id, resizing);
-  let live = "";
   for (const [id, node] of liveNodes) {
     try {
       const r = nodeRect(node);
-      live += id + ":" + (r.x | 0) + "," + (r.y | 0) + "," +
-        (r.w | 0) + "," + (r.h | 0) + ";";
+      sigStep(h, id | 0);
+      sigStep(h, r.x | 0);
+      sigStep(h, r.y | 0);
+      sigStep(h, r.w | 0);
+      sigStep(h, r.h | 0);
     } catch {}
   }
-  return s + "l" + count + "|b" + live;
+  return sigDone(h);
 }
 
 // --- collision checks ---
@@ -349,12 +382,14 @@ function refreshGraph(graph, linkEntries, rectCache, deferBuild = false) {
   const interactiveChange = shouldUseDragSettle(pointerHeld, profile, app.canvas);
   if (interactiveChange) {
     M._nodeDragActive = true;
+    cancelDragPauseWorker();
     M._dragPauseActive = false;
     M._dragPausePending = false;
     M._dragPauseQueue = null;
     M._dragPauseCleanupLinkIds.clear();
     M._dragPauseAttemptedLinkIds.clear();
     M._dragPauseCompletedLinkIds.clear();
+    clearPauseReveals(); // geometry moved on: queued paths are stale
     if (M.settleTimer) clearTimeout(M.settleTimer);
     const finishSettle = () => {
       if (M._pointerDown) {
@@ -368,6 +403,8 @@ function refreshGraph(graph, linkEntries, rectCache, deferBuild = false) {
         return;
       }
       M.settleTimer = null;
+      cancelDragPauseWorker();
+      flushPauseReveals(); // pause geometry is final: apply pending reveals now
       const movedIds = M._dragMovedIds || new Set();
       const finalRects = [];
       for (const id of movedIds) {
@@ -453,10 +490,16 @@ function reportRouteProfile(startedAt, stats) {
   });
 }
 
-function rememberRouteCost(linkId, elapsedMs) {
+function rememberRouteCost(linkId, elapsedMs, onMainThread = false) {
   const previous = M.routeCostByLink.get(linkId);
   M.routeCostByLink.set(linkId, updateRouteCost(previous, elapsedMs));
   M.routeCostAverage = updateRouteCost(M.routeCostAverage, elapsedMs, 0.08);
+  // The pause race only trusts costs measured on this thread: worker timings
+  // come from a cold-JIT VM and do not predict main-thread route cost.
+  if (onMainThread) {
+    const prevMT = M.routeCostByLinkMT.get(linkId);
+    M.routeCostByLinkMT.set(linkId, updateRouteCost(prevMT, elapsedMs));
+  }
 }
 
 function predictedRouteCost(linkIds) {
@@ -471,6 +514,8 @@ function predictedRouteCost(linkIds) {
 const PROGRESSIVE_BUDGET_MS = 12;
 
 function cancelProgressiveBatch() {
+  clearWorkerRescue();
+  if (M.routeBatch?.worker) cancelWorkerBatch();
   if (M.routeBatchRaf) {
     const cancel = globalThis.cancelAnimationFrame || globalThis.clearTimeout;
     cancel?.(M.routeBatchRaf);
@@ -488,14 +533,386 @@ function scheduleProgressiveBatch() {
   });
 }
 
+// --- worker routing (Phase D) ---
+//
+// Only the stable (non-drag) path is eligible, and only for batches large
+// enough that a worker round-trip beats same-frame latency. Drag routing and
+// small interactive batches stay synchronous on the main thread — identical
+// to previous behaviour. The worker runs the very same router.js with the
+// same margin/bendPenalty and no heuristic opts, so worker routes are
+// bit-identical to the sync stable path.
+
+const WORKER_MIN_JOBS = 8;
+const WORKER_MIN_MS = 24;
+
+function workerEligibleFor(jobs) {
+  if (!workerRoutingUsable()) return false;
+  if (jobs.length >= WORKER_MIN_JOBS) return true;
+  return predictedRouteCost(jobs.map((j) => j.entry.link.id)) >= WORKER_MIN_MS;
+}
+
+// The main-thread router is also the drag/stretch backend, so its build is
+// deferred on stable worker frames. Any path that needs a fresh main router
+// (sync routing, sticky validation with pending failures) forces it here.
+function ensureMainRouterFresh(graph, entries, rectCache) {
+  if (M._deferredGraphBuild) refreshGraph(graph, entries, rectCache, false);
+}
+
+function buildWorkerPayload(batch, rectCache) {
+  const nodes = batch.graph._nodes || [];
+  const rects = new Float64Array(nodes.length * 4);
+  for (let i = 0; i < nodes.length; i++) {
+    const rc = cachedNodeRect(nodes[i], rectCache);
+    rects[4 * i] = rc.x;
+    rects[4 * i + 1] = rc.y;
+    rects[4 * i + 2] = rc.w;
+    rects[4 * i + 3] = rc.h;
+  }
+  // Same terminal set as refreshGraph's main-thread build.
+  const terminals = [];
+  for (const e of batch.entries) {
+    const ep = endpoints(e, rectCache);
+    if (!ep) continue;
+    terminals.push(
+      ep.stubOut.x, ep.stubOut.y, ep.stubIn.x, ep.stubIn.y,
+      ep.bodyOut.x, ep.bodyOut.y, ep.bodyIn.x, ep.bodyIn.y,
+      ep.out.x, ep.out.y, ep.inp.x, ep.inp.y,
+    );
+  }
+  const jobs = batch.jobs.map((job) => {
+    const ep = job.ep;
+    const old = M.pathCache.get(job.entry.link.id)?.pts;
+    let oldPts = null;
+    if (old && old.length >= 4) {
+      oldPts = new Float64Array(old.length * 2);
+      for (let i = 0; i < old.length; i++) {
+        oldPts[2 * i] = old[i].x;
+        oldPts[2 * i + 1] = old[i].y;
+      }
+    }
+    return {
+      id: job.entry.link.id,
+      endsKey: job.endsKey,
+      opts: job.opts || null,
+      oldPts,
+      pts: [
+        ep.out.x, ep.out.y, ep.bodyOut.x, ep.bodyOut.y,
+        ep.stubOut.x, ep.stubOut.y, ep.stubIn.x, ep.stubIn.y,
+        ep.bodyIn.x, ep.bodyIn.y, ep.inp.x, ep.inp.y,
+      ],
+    };
+  });
+  const margin = M.currentMargin();
+  const bendPenalty = +M.S.bendPenalty || 40;
+  return {
+    type: "route",
+    graphRev: batch.fastSig,
+    configKey: JSON.stringify({ margin, bendPenalty }),
+    margin,
+    bendPenalty,
+    rects,
+    terminals: new Float64Array(terminals),
+    jobs,
+  };
+}
+
+function tryDispatchWorkerBatch(batch, rectCache) {
+  const jobRev = dispatchWorkerBatch(buildWorkerPayload(batch, rectCache));
+  if (jobRev === false) return false;
+  batch.worker = true;
+  batch.jobRev = jobRev;
+  M.routeBatch = batch;
+  armWorkerRescue(batch);
+  return true;
+}
+
+// --- stalled-worker rescue ---
+// A healthy worker batch streams its first results within ~100-300ms. Hard
+// exact searches can grind for seconds on the cold worker (measured ~16x
+// slower per pop than the hot main thread), and while the canvas is idle no
+// frames run — so a frame-driven check would never fire. Arm a timer: a
+// batch with no new result for WORKER_RESCUE_MS is cancelled and continued
+// on the main thread by the regular progressive machinery.
+const WORKER_RESCUE_MS = 400;
+let workerRescueTimer = 0;
+
+function clearWorkerRescue() {
+  clearTimeout(workerRescueTimer);
+  workerRescueTimer = 0;
+}
+
+function rescueWorkerBatch(batch) {
+  clearWorkerRescue();
+  cancelWorkerBatch(); // rev-bump stales late results; the worker aborts at its chunk boundary
+  batch.worker = false;
+  batch.workerRescued = true;
+  // Results that already streamed in stay valid; only the remainder is
+  // re-queued for the main-thread progressive drain.
+  batch.jobs = batch.jobs.filter((j) => !batch.resultsById.has(j.entry.link.id));
+  batch.jobsById = new Map(batch.jobs.map((j) => [j.entry.link.id, j]));
+  batch.index = 0;
+  app.canvas?.setDirty(true, true);
+}
+
+function armWorkerRescue(batch) {
+  clearWorkerRescue();
+  workerRescueTimer = setTimeout(() => {
+    if (M.routeBatch === batch && batch.worker) rescueWorkerBatch(batch);
+  }, WORKER_RESCUE_MS);
+}
+
+// Held-pause race: while the worker chews through the pause queue, the main
+// thread may immediately route links predicted cheaper than this — short
+// pauses keep the old one-by-one feedback, heavy links stay off-thread.
+const PAUSE_RACE_MAX_MS = 10;
+
+// --- held-pause worker queue ---
+// A held pause re-routes its queue across frames anyway (it is not per-frame
+// interactive), so the whole queue can go to the worker: one heavy link no
+// longer stalls the main thread for a 30-130ms frame at a time. Worker jobs
+// use the very same {weight: 2.5, popsBudget: 80000} opts as the main-thread
+// drain, on the same graph snapshot, so paths are bit-identical either way.
+
+let pauseWorkerReroutes = 0;
+let pauseWorkerMs = 0;
+
+function cancelDragPauseWorker() {
+  if (!M._dragPauseWorker) return;
+  M._dragPauseWorker = null;
+  cancelWorkerBatch();
+}
+
+function tryDispatchDragPauseWorker(graph, fastSig, entries, rectCache) {
+  // The worker channel is shared with stable progressive batches. Cancel an
+  // in-flight one first: the rev bump below would orphan it silently (its
+  // results/done arrive stale and are dropped, leaving routeBatch stuck).
+  if (M.routeBatch?.worker) {
+    cancelProgressiveBatch();
+    M.routeFastSig = "";
+  }
+  const byId = new Map(entries.map((e) => [e.link.id, e]));
+  const jobs = [];
+  for (const id of M._dragPauseQueue) {
+    const entry = byId.get(id);
+    if (!entry) continue;
+    const ep = endpoints(entry, rectCache);
+    if (!ep) continue;
+    const endsKey =
+      (ep.out.x | 0) + "," + (ep.out.y | 0) + "|" + (ep.inp.x | 0) + "," + (ep.inp.y | 0);
+    jobs.push({ entry, ep, endsKey, opts: { weight: 2.5, popsBudget: 80000 } });
+  }
+  if (!workerEligibleFor(jobs)) return false;
+  const batch = { graph, entries, jobs, fastSig };
+  const jobRev = dispatchWorkerBatch(buildWorkerPayload(batch, rectCache));
+  if (jobRev === false) return false;
+  M._dragPauseWorker = {
+    jobRev,
+    jobsById: new Map(jobs.map((j) => [j.entry.link.id, j])),
+  };
+  return true;
+}
+
+function handleDragPauseWorkerResult(msg) {
+  const job = M._dragPauseWorker?.jobsById.get(msg.id);
+  if (!job) return;
+  const linkId = msg.id;
+  pauseWorkerReroutes++;
+  pauseWorkerMs += msg.ms || 0;
+  rememberRouteCost(linkId, msg.ms || 0);
+  M._dragPauseAttemptedLinkIds.add(linkId);
+  const qi = M._dragPauseQueue ? M._dragPauseQueue.indexOf(linkId) : -1;
+  if (qi >= 0) M._dragPauseQueue.splice(qi, 1);
+  M._dragPauseCleanupLinkIds.delete(linkId);
+  if (msg.ok && msg.buf) {
+    const pts = [];
+    for (let i = 0; i < msg.buf.length; i += 2)
+      pts.push({ x: msg.buf[i], y: msg.buf[i + 1] });
+    M.failedRoutes.delete(linkId);
+    const cached = { ends: job.endsKey, sticky: !!msg.sticky };
+    setCachedPath(cached, pts);
+    // Do not draw mid-pump: queue the path for the reveal pass below, which
+    // drains on the next frame (fast-hit is suppressed while it is non-empty).
+    M._dragPauseRevealQueue.push({ linkId, cached });
+  } else {
+    // Same bookkeeping as the main-thread drain: negative-cache the failure;
+    // the link keeps its frozen/hidden placeholder until the release pass.
+    rememberRouteFailure(linkId, job.endsKey, job.ep);
+  }
+  app.canvas?.setDirty(false, true);
+}
+
+// --- reveal of held-pause worker results ---
+// A reveal is two Map writes and a Set add/delete: effectively free, so the
+// whole pending queue drains in one frame (see pauseRevealCount).
+// Lifecycle: entries are enqueued while the pause is active; resuming the
+// drag (geometry changed) clears the queue because those paths were computed
+// for the pre-move geometry; releasing the pointer flushes the remainder so
+// the settle pass sees final paths.
+
+function applyPauseReveal(item) {
+  M.pathCache.set(item.linkId, item.cached);
+  M._dragPauseCompletedLinkIds.add(item.linkId);
+  M._dragHiddenLinkIds.delete(item.linkId);
+}
+
+function clearPauseReveals() {
+  M._dragPauseRevealQueue.length = 0;
+}
+
+function flushPauseReveals() {
+  const q = M._dragPauseRevealQueue;
+  if (!q.length) return;
+  for (const item of q) applyPauseReveal(item);
+  q.length = 0;
+}
+
+function applyPauseRevealsForFrame() {
+  const q = M._dragPauseRevealQueue;
+  if (!q.length) return;
+  if (!M._dragPauseActive) {
+    // Pause state was reset without a clear/flush (defensive): never reveal
+    // paths computed against geometry that no longer exists.
+    q.length = 0;
+    return;
+  }
+  const count = Math.min(pauseRevealCount(q.length), q.length);
+  for (let i = 0; i < count; i++) applyPauseReveal(q.shift());
+  // Keep frames coming while the queue drains.
+  if (q.length) app.canvas?.setDirty(false, true);
+}
+
+initWorkerClient({
+  onResult(msg) {
+    if (M._dragPauseWorker && msg.jobRev === M._dragPauseWorker.jobRev) {
+      handleDragPauseWorkerResult(msg);
+      return;
+    }
+    const batch = M.routeBatch;
+    if (!batch || !batch.worker || msg.jobRev !== batch.jobRev) return;
+    const job = batch.jobsById.get(msg.id);
+    if (!job) return;
+    batch.workerResolved++;
+    batch.workerMs += msg.ms || 0;
+    rememberRouteCost(msg.id, msg.ms || 0);
+    if (msg.stats) {
+      batch.aStarPops += msg.stats.pops || 0;
+      batch.simpleHits += msg.stats.simple || 0;
+      if (msg.stats.level > 1) batch.winEscalations++;
+    }
+    if (msg.ok && msg.buf) {
+      const pts = [];
+      for (let i = 0; i < msg.buf.length; i += 2)
+        pts.push({ x: msg.buf[i], y: msg.buf[i + 1] });
+      M.failedRoutes.delete(msg.id);
+      const cached = { ends: job.endsKey, sticky: !!msg.sticky };
+      setCachedPath(cached, pts);
+      M.pathCache.set(msg.id, cached);
+      batch.resultsById.set(msg.id, { entry: job.entry, cached });
+    } else {
+      // The worker already attempted its own sticky stretch before failing.
+      batch.routeFailures++;
+      rememberRouteFailure(msg.id, job.endsKey, job.ep);
+    }
+    scheduleProgressiveBatch(); // throttled repaint with the new partial set
+    armWorkerRescue(batch); // progress: push the rescue deadline out
+  },
+  onDone(jobRev) {
+    if (M._dragPauseWorker && jobRev === M._dragPauseWorker.jobRev) {
+      M._dragPauseWorker = null;
+      M._dragPausePending = false;
+      app.canvas?.setDirty(false, true);
+      return;
+    }
+    const batch = M.routeBatch;
+    if (!batch || !batch.worker || batch.jobRev !== jobRev) return;
+    clearWorkerRescue();
+    const results = orderedRouteResults(batch.entries, batch.resultsById);
+    reportRouteProfile(batch.profileStarted, {
+      fastHit: false,
+      ...(batch.firstFrame ? batch.profile : { graphRebuilt: false }),
+      progressive: true,
+      worker: true,
+      queuedLinks: batch.jobs.length,
+      reroutedLinks: batch.workerResolved,
+      connectorCalls: batch.workerResolved,
+      connectorMs: roundedGeometry(batch.workerMs),
+      routeFailures: batch.routeFailures,
+      negativeSkips: batch.negativeSkips,
+      aStarPops: batch.aStarPops,
+      routeWindow: batch.winEscalations,
+      routeSimple: batch.simpleHits,
+      links: batch.entries.length,
+    });
+    finishStableRoutes(batch, results);
+    app.canvas?.setDirty(true, true);
+  },
+  onFailed() {
+    clearWorkerRescue();
+    M._dragPauseWorker = null;
+    // Drop the dead worker batch; the next frame re-routes synchronously.
+    if (M.routeBatch?.worker) {
+      M.routeBatch = null;
+      app.canvas?.setDirty(true, true);
+    }
+  },
+});
+
 function cleanupDeadPaths(entries) {
-  if (M.pathCache.size <= entries.length) return;
+  if (M.pathCache.size <= entries.length && M.failedRoutes.size <= entries.length) return;
   const alive = new Set(entries.map((e) => e.link.id));
   for (const id of M.pathCache.keys()) {
     if (alive.has(id)) continue;
     M.pathCache.delete(id);
     M.routeCostByLink.delete(id);
+    M.routeCostByLinkMT.delete(id);
   }
+  for (const id of M.failedRoutes.keys()) {
+    if (!alive.has(id)) M.failedRoutes.delete(id);
+  }
+}
+
+// --- route failure negative cache ---
+// A link that fails to route (usually by exhausting the A* pop budget on a
+// large graph) must not retry a full-priced search on every geometry change.
+// Failures are remembered with exponential backoff; a failure is retried
+// early only when its endpoints moved or a node moved near its corridor.
+// Links without a successful route stay undrawn (unchanged behaviour) but
+// no longer burn 50-150ms per retry per geometry change.
+
+function failureBounds(ep) {
+  return {
+    x: Math.min(ep.out.x, ep.inp.x),
+    y: Math.min(ep.out.y, ep.inp.y),
+    x2: Math.max(ep.out.x, ep.inp.x),
+    y2: Math.max(ep.out.y, ep.inp.y),
+  };
+}
+
+function rectsHitBounds(rects, b) {
+  if (!rects || !b) return false;
+  for (const r of rects)
+    if (r.x < b.x2 && r.x2 > b.x && r.y < b.y2 && r.y2 > b.y) return true;
+  return false;
+}
+
+function rememberRouteFailure(linkId, endsKey, ep) {
+  const prev = M.failedRoutes.get(linkId);
+  const fails = (prev?.fails || 0) + 1;
+  M.failedRoutes.set(linkId, {
+    ends: endsKey,
+    fails,
+    retryAt: performance.now() + Math.min(500 * 2 ** Math.min(fails, 6), 15000),
+    bounds: ep ? failureBounds(ep) : null,
+  });
+}
+
+// True when this link's previous failure still applies and no nearby
+// geometry change makes an early retry worthwhile.
+function shouldSkipFailedRoute(linkId, endsKey, dirtyRects) {
+  const neg = M.failedRoutes.get(linkId);
+  if (!neg || neg.ends !== endsKey) return false;
+  if (performance.now() >= neg.retryAt) return false;
+  return !rectsHitBounds(dirtyRects, neg.bounds);
 }
 
 function finishStableRoutes(batch, results) {
@@ -507,6 +924,10 @@ function finishStableRoutes(batch, results) {
 }
 
 function continueStableRoutes(batch, profileStarted) {
+  if (batch.worker) {
+    // Worker batches are message-driven; frames only re-emit partial results.
+    return orderedRouteResults(batch.entries, batch.resultsById);
+  }
   let connectorMs = 0;
   const routeOne = (job) => {
     const started = performance.now();
@@ -520,8 +941,32 @@ function continueStableRoutes(batch, profileStarted) {
     );
     const elapsed = performance.now() - started;
     connectorMs += elapsed;
-    rememberRouteCost(job.entry.link.id, elapsed);
-    if (!pts) return null;
+    rememberRouteCost(job.entry.link.id, elapsed, true);
+    const st = M.router.lastStats;
+    if (st) {
+      batch.aStarPops += st.pops;
+      batch.simpleHits += st.simple;
+      if (st.level > 1) batch.winEscalations++;
+    }
+    if (!pts) {
+      batch.routeFailures++;
+      rememberRouteFailure(job.entry.link.id, job.endsKey, job.ep);
+      // Degrade gracefully: keep the last legal path on screen, stretched
+      // to the current endpoints, instead of making the link vanish.
+      // stretchPath validates that no unexpected node body is crossed.
+      const stickyPts = stretchPath(
+        M.pathCache.get(job.entry.link.id)?.pts,
+        job.ep,
+      );
+      if (stickyPts) {
+        const sticky = { ends: job.endsKey, sticky: true };
+        setCachedPath(sticky, stickyPts);
+        M.pathCache.set(job.entry.link.id, sticky);
+        return { entry: job.entry, cached: sticky };
+      }
+      return null;
+    }
+    M.failedRoutes.delete(job.entry.link.id);
     const cached = { ends: job.endsKey, sticky: false };
     setCachedPath(cached, pts);
     M.pathCache.set(job.entry.link.id, cached);
@@ -541,11 +986,17 @@ function continueStableRoutes(batch, profileStarted) {
     fastHit: false,
     ...profile,
     progressive: batch.progressive,
+    workerRescued: !!batch.workerRescued,
     queuedLinks: batch.jobs.length,
     batchRemaining: slice.remaining,
     reroutedLinks: slice.processed,
     connectorCalls: slice.processed,
     connectorMs: roundedGeometry(connectorMs),
+    routeFailures: batch.routeFailures,
+    negativeSkips: batch.negativeSkips,
+    aStarPops: batch.aStarPops,
+    routeWindow: batch.winEscalations,
+    routeSimple: batch.simpleHits,
     links: batch.entries.length,
   });
   batch.firstFrame = false;
@@ -562,8 +1013,12 @@ function continueStableRoutes(batch, profileStarted) {
 }
 
 function prepareStableRoutes(graph, fastSig, entries, rectCache, dirty, profileStarted, forceSync) {
+  // Sticky re-validation below uses the main-thread router; if failures are
+  // in backoff the router must be fresh (stable worker frames defer it).
+  if (M.failedRoutes.size > 0) ensureMainRouterFresh(graph, entries, rectCache);
   const resultsById = new Map();
   const jobs = [];
+  let negativeSkips = 0;
   for (const entry of entries) {
     const ep = endpoints(entry, rectCache);
     if (!ep) {
@@ -586,8 +1041,29 @@ function prepareStableRoutes(graph, fastSig, entries, rectCache, dirty, profileS
     const cached = M.pathCache.get(entry.link.id);
     const endsMoved = !cached || cached.ends !== endsKey;
     const hitDirty = dirty._rects && cached?.pts && pathHitsRects(cached.pts, dirty._rects);
-    if (endsMoved || hitDirty) jobs.push({ entry, ep, endsKey });
-    else if (cached?.pts) resultsById.set(entry.link.id, { entry, cached });
+    if (endsMoved || hitDirty) {
+      // A previous failure under the same endpoints stays skipped until its
+      // backoff elapses or a node moves near the link's corridor. The stale
+      // cached pts are only a visual placeholder after a failure, so they
+      // must not suppress the skip.
+      if (
+        endsMoved &&
+        shouldSkipFailedRoute(entry.link.id, endsKey, dirty._rects)
+      ) {
+        negativeSkips++;
+        // Backoff means "do not re-route yet", not "show nothing": keep the
+        // last legal path on screen, re-stretched to the current endpoints.
+        const stickyPts = stretchPath(cached?.pts, ep);
+        if (stickyPts) {
+          const sticky = { ends: endsKey, sticky: true };
+          setCachedPath(sticky, stickyPts);
+          M.pathCache.set(entry.link.id, sticky);
+          resultsById.set(entry.link.id, { entry, cached: sticky });
+        }
+        continue;
+      }
+      jobs.push({ entry, ep, endsKey });
+    } else if (cached?.pts) resultsById.set(entry.link.id, { entry, cached });
   }
 
   const progressive = shouldProgressivelyRoute(false, forceSync, jobs.length);
@@ -596,55 +1072,56 @@ function prepareStableRoutes(graph, fastSig, entries, rectCache, dirty, profileS
     fastSig,
     entries,
     jobs,
+    jobsById: new Map(jobs.map((j) => [j.entry.link.id, j])),
     index: 0,
     resultsById,
     profile: dirty._profile,
+    profileStarted,
     firstFrame: true,
     progressive,
+    routeFailures: 0,
+    negativeSkips,
+    aStarPops: 0,
+    winEscalations: 0,
+    simpleHits: 0,
+    worker: false,
+    jobRev: 0,
+    workerResolved: 0,
+    workerMs: 0,
+    workerRescued: false,
   };
+
+  // Phase D: large stable batches route in the background worker. The first
+  // frame returns only the already-cached results; worker results reveal
+  // progressively as they arrive (same semantics as the sync progressive
+  // path, but with zero main-thread search time).
+  if (jobs.length > 0 && workerEligibleFor(jobs) && tryDispatchWorkerBatch(batch, rectCache)) {
+    reportRouteProfile(profileStarted, {
+      fastHit: false,
+      ...batch.profile,
+      progressive: true,
+      worker: true,
+      queuedLinks: jobs.length,
+      batchRemaining: jobs.length,
+      links: entries.length,
+    });
+    return orderedRouteResults(entries, resultsById);
+  }
+
+  // Sync routing needs the main-thread router; rebuild it now if a stable
+  // worker frame deferred it. Also force a fresh build when failure backoff
+  // may re-validate sticky paths below.
+  ensureMainRouterFresh(graph, entries, rectCache);
   if (progressive) M.routeBatch = batch;
   return continueStableRoutes(batch, profileStarted);
 }
 
 // --- path stretch (drag anti-flicker) ---
+// Shared implementation lives in stretch.js so the router worker can run the
+// identical stretch against its own fresh OrthoRouter instance.
 
 function stretchPath(oldPts, ep) {
-  if (!oldPts || oldPts.length < 4) return null;
-  const pts = oldPts.map((p) => ({ x: p.x, y: p.y }));
-  const oldN = pts.length;
-  pts[0] = ep.out;
-  pts[1] = { x: ep.stubOut.x, y: ep.stubOut.y };
-  pts[oldN - 1] = ep.inp;
-  pts[oldN - 2] = { x: ep.stubIn.x, y: ep.stubIn.y };
-
-  // A formerly straight four-point connector becomes diagonal when one end
-  // moves vertically.  Insert a temporary centre dogleg so it can remain
-  // sticky instead of invoking A* on every drag frame.
-  if (
-    oldN === 4 &&
-    Math.abs(pts[1].x - pts[2].x) > 0.6 &&
-    Math.abs(pts[1].y - pts[2].y) > 0.6
-  ) {
-    const mx = (pts[1].x + pts[2].x) / 2;
-    pts.splice(2, 0, { x: mx, y: pts[1].y }, { x: mx, y: pts[2].y });
-  } else if (oldN >= 5) {
-    const n = pts.length;
-    const a = pts[1], b = pts[2];
-    if (Math.abs(oldPts[1].y - oldPts[2].y) < 0.6) b.y = a.y;
-    else b.x = a.x;
-    const y = pts[n - 2], z = pts[n - 3];
-    if (Math.abs(oldPts[n - 2].y - oldPts[n - 3].y) < 0.6) z.y = y.y;
-    else z.x = y.x;
-  }
-  for (let k = 0; k < pts.length - 1; k++) {
-    if (Math.abs(pts[k].x - pts[k + 1].x) > 0.6 && Math.abs(pts[k].y - pts[k + 1].y) > 0.6)
-      return null;
-  }
-  const raw = M.router.raw || [];
-  const sourceIndex = M.router._endpointRectIndex(ep.bodyOut, ep.stubOut, true);
-  const targetIndex = M.router._endpointRectIndex(ep.bodyIn, ep.stubIn, false);
-  if (stretchedPathCrossesUnexpectedNode(pts, raw, sourceIndex, targetIndex)) return null;
-  return pts;
+  return stretchPathPure(M.router, oldPts, ep);
 }
 
 // --- cache + precompute ---
@@ -670,12 +1147,15 @@ export function routeAll(graph) {
   const profileStarted = profiler.active ? performance.now() : 0;
   if (M.routeGraph && M.routeGraph !== graph) {
     cancelProgressiveBatch();
+    cancelDragPauseWorker();
     M.graphSig = "";
     M.routeFastSig = "";
     M.routeResults = null;
     M.prevRects = new Map();
     M.pathCache.clear();
+    M.failedRoutes.clear();
     M.routeCostByLink.clear();
+    M.routeCostByLinkMT.clear();
     M.routeCostAverage = NaN;
     M._dragAdaptiveMode = null;
     M._dragHeavyActive = null;
@@ -684,13 +1164,37 @@ export function routeAll(graph) {
   }
   const fastSig = fastGraphSignature(graph, app.canvas);
   if (M.routeBatch) {
-    if (M.routeBatch.graph === graph && M.routeBatch.fastSig === fastSig)
-      return continueStableRoutes(M.routeBatch, profileStarted);
-    if (M._pointerDown) M._dragInterruptedBatch = true;
-    cancelProgressiveBatch();
-    M.routeFastSig = "";
+    if (M.routeBatch.graph === graph && M.routeBatch.fastSig === fastSig) {
+      if (M.routeBatch.worker) {
+        if (M.S.workerRouting !== false && !M._workerFailed) {
+          // Worker-driven batch: frames just re-emit the latest partial set.
+          return orderedRouteResults(M.routeBatch.entries, M.routeBatch.resultsById);
+        }
+        // Toggled off (or failed) mid-flight: abandon the worker batch and
+        // fall through to a synchronous round below.
+        cancelProgressiveBatch();
+        M.routeFastSig = "";
+      } else {
+        return continueStableRoutes(M.routeBatch, profileStarted);
+      }
+    } else {
+      if (M._pointerDown) M._dragInterruptedBatch = true;
+      cancelProgressiveBatch();
+      M.routeFastSig = "";
+    }
   }
-  if (M.routeGraph === graph && fastSig === M.routeFastSig && M.routeResults) {
+  // Pause reveals must not fast-hit: the reveal queue only drains on the full
+  // path below, and revealed links only render when results are rebuilt. The
+  // worker empties the compute queue quickly, which used to silence every
+  // full-frame trigger and stranded 8-14 computed paths unseen until the drag
+  // resumed and discarded them. Full rebuilds are cache reads (~1-2ms), so
+  // keep taking the full path until the queue has fully played out.
+  if (
+    M.routeGraph === graph &&
+    fastSig === M.routeFastSig &&
+    M.routeResults &&
+    !M._dragPauseRevealQueue.length
+  ) {
     reportRouteProfile(profileStarted, { fastHit: true, graphRebuilt: false, reroutedLinks: 0 });
     return M.routeResults;
   }
@@ -710,12 +1214,14 @@ export function routeAll(graph) {
   ) {
     // A held pause has resumed moving. Return to the deferred scheduler before
     // refreshGraph so the first resumed frame does not pay a full OVG build.
+    cancelDragPauseWorker();
     M._dragPauseActive = false;
     M._dragPausePending = false;
     M._dragPauseQueue = null;
     M._dragPauseCleanupLinkIds.clear();
     M._dragPauseAttemptedLinkIds.clear();
     M._dragPauseCompletedLinkIds.clear();
+    clearPauseReveals(); // geometry moved on: queued paths are stale
   }
   const deferHeavyBuild = shouldDeferHeavyGraphBuild(
     M._dragHeavyActive,
@@ -724,7 +1230,13 @@ export function routeAll(graph) {
     M.routeGraph === graph && !!M.routeResults,
   );
   const rectCache = new Map();
-  const dirty = refreshGraph(graph, entries, rectCache, deferHeavyBuild);
+  // Stable frames on the worker path skip the main-thread OVG build; the
+  // main router is only needed for drag/stretch/sync routing and is rebuilt
+  // lazily via ensureMainRouterFresh. During a drag (or its settle window)
+  // the build follows the existing drag rules instead.
+  const deferForWorker =
+    !M._pointerDown && M.settleTimer === null && workerRoutingUsable();
+  const dirty = refreshGraph(graph, entries, rectCache, deferHeavyBuild || deferForWorker);
   if (M._lastDragSettle) {
     dirty._profile.dragSettle = M._lastDragSettle;
     M._lastDragSettle = null;
@@ -848,7 +1360,39 @@ export function routeAll(graph) {
     M._dragPauseCleanupLinkIds = new Set(cleanupQueue.map((item) => item.id));
     M._dragPauseQueue = [...primaryQueue, ...cleanupQueue].map((item) => item.id);
   }
-  const pauseNextLinkId = M._dragPauseActive ? M._dragPauseQueue?.[0] : null;
+  // Held-pause re-routes are not per-frame interactive: hand the whole queue
+  // to the worker so one heavy link cannot stall the main thread. While a
+  // worker batch is in flight the per-frame main-thread drain below is
+  // skipped; results stream back into pathCache between frames.
+  if (
+    M._dragPauseActive &&
+    M._dragPauseQueue?.length &&
+    !M._dragPauseWorker &&
+    M.S.workerHeldPause !== false
+  ) {
+    tryDispatchDragPauseWorker(graph, fastSig, entries, rectCache);
+  }
+  // Reveal worker-computed paths as soon as they land (the queue drains in
+  // one frame; see pauseRevealCount for why pacing was removed).
+  applyPauseRevealsForFrame();
+  // While the worker holds the pause queue, the main thread races ahead only
+  // on links MEASURED cheap on this thread (routeCostByLinkMT). Unknown links
+  // get an infinite fallback: they are exactly the ones that turned into
+  // 19-49ms main-thread routes and long tasks when worker timings or the
+  // session average were trusted instead.
+  let pauseNextLinkId = null;
+  if (M._dragPauseActive && M._dragPauseQueue?.length) {
+    if (!M._dragPauseWorker) {
+      pauseNextLinkId = M._dragPauseQueue[0];
+    } else {
+      for (const id of M._dragPauseQueue) {
+        if (shouldRacePauseLink(M.routeCostByLinkMT.get(id), Infinity, PAUSE_RACE_MAX_MS)) {
+          pauseNextLinkId = id;
+          break;
+        }
+      }
+    }
+  }
 
   // Mode 4: pointer held down (even paused) keeps links hidden.
   const dragging = rawDragging ||
@@ -875,6 +1419,9 @@ export function routeAll(graph) {
   let heldDirectReroutes = 0;
   let heldCleanupReroutes = 0;
   let liveCollisionReroutes = 0;
+  let aStarPops = 0;
+  let winEscalations = 0;
+  let simpleHits = 0;
   const collisionBudget = liveCollisionBudget(effectiveMode, draggedLinkIds.size);
 
   for (const e of entries) {
@@ -959,7 +1506,9 @@ export function routeAll(graph) {
     const finishPauseRoute = (completed, cached = null) => {
       if (!pauseRoute) return;
       M._dragPauseAttemptedLinkIds.add(e.link.id);
-      if (M._dragPauseQueue?.[0] === e.link.id) M._dragPauseQueue.shift();
+      // A raced link can sit anywhere in the queue, not just at the head.
+    const pauseQueueIdx = M._dragPauseQueue ? M._dragPauseQueue.indexOf(e.link.id) : -1;
+    if (pauseQueueIdx >= 0) M._dragPauseQueue.splice(pauseQueueIdx, 1);
       if (!completed) return;
       M._dragPauseCompletedLinkIds.add(e.link.id);
       if (pauseDirect) {
@@ -995,6 +1544,18 @@ export function routeAll(graph) {
     const hitDirty = collisionLinkIds.has(e.link.id);
 
     if (endsMoved || hitDirty || pauseRoute) {
+      // Same negative-cache rule as the stable path: a link that failed
+      // under these endpoints does not retry until backoff elapses or the
+      // geometry near it changed. Held-pause routes bypass the cache
+      // because the user is explicitly waiting on that link. Stale cached
+      // pts are only a visual placeholder and must not suppress the skip.
+      if (
+        !pauseRoute &&
+        shouldSkipFailedRoute(e.link.id, endsKey, collisionRects || dirty._rects)
+      ) {
+        finishPauseRoute(false);
+        continue;
+      }
       reroutedLinks++;
       let pts = null, sticky = false;
       if (!pauseRoute && M.S.stickiness && shouldStretchDragPath({
@@ -1009,6 +1570,8 @@ export function routeAll(graph) {
       }
       if (!pts) {
         const connectorStarted = performance.now();
+        // Interactive routing uses a weighted heuristic (bounded-suboptimal,
+        // ~5x faster); the settle pass re-routes exact at weight 1.
         pts = M.router.routeConnector(
           ep.out,
           ep.bodyOut,
@@ -1016,15 +1579,24 @@ export function routeAll(graph) {
           ep.stubIn,
           ep.bodyIn,
           ep.inp,
+          { weight: 2.5, popsBudget: 80000 },
         );
         const elapsed = performance.now() - connectorStarted;
         connectorCalls++;
         connectorMs += elapsed;
-        rememberRouteCost(e.link.id, elapsed);
+        rememberRouteCost(e.link.id, elapsed, true);
+        const st = M.router.lastStats;
+        if (st) {
+          aStarPops += st.pops;
+          simpleHits += st.simple;
+          if (st.level > 1) winEscalations++;
+        }
+        if (pts) M.failedRoutes.delete(e.link.id);
       }
       // A physically overlapping layout can genuinely have no legal path.
       // Never replace that with a fallback which cuts through a node.
       if (!pts) {
+        rememberRouteFailure(e.link.id, endsKey, ep);
         finishPauseRoute(false);
         continue;
       }
@@ -1039,6 +1611,25 @@ export function routeAll(graph) {
   cleanupDeadPaths(entries);
   M._dragPausePending = !!(M._dragPauseActive && M._dragPauseQueue?.length);
   const nextDragMode = effectiveMode;
+  // Adaptive measured-cost escalation: the count-based lock can pick
+  // freeze-others for a dense pocket where predictedMs underestimates the
+  // real connector cost 2-4x, pinning the whole gesture at 60-130ms frames.
+  // Escalate from the frame's measured connector time instead. Escalation is
+  // one-way within a gesture (never re-shows hidden links mid-drag); the
+  // lock resets when the gesture settles.
+  if (
+    dragMode === "adaptive" &&
+    M.S.adaptiveEscalation !== false &&
+    M._dragAdaptiveMode &&
+    !M._dragHeavyActive &&
+    connectorMs > 0
+  ) {
+    M._dragAdaptiveMode = escalateLockedDragMode(
+      M._dragAdaptiveMode,
+      connectorMs,
+      activeLinkIds.size,
+    );
+  }
   M.routeGraph = graph;
   M.routeFastSig = fastSig;
   M._dragLastFastSig = fastSig;
@@ -1066,9 +1657,26 @@ export function routeAll(graph) {
     heldDirectReroutes,
     heldCleanupReroutes,
     pauseQueueRemaining: M._dragPauseQueue?.length || 0,
+    pauseRevealRemaining: M._dragPauseRevealQueue.length,
+    // Why a held pause did (or did not) go to the worker — makes fallback
+    // frames self-explanatory in profiler reports.
+    pauseWorkerGate: M._workerFailed
+      ? "worker-failed"
+      : M.S.workerRouting === false
+        ? "worker-routing-off"
+        : M.S.workerHeldPause === false
+          ? "held-pause-off"
+          : "on",
+    heldWorkerReroutes: pauseWorkerReroutes,
+    heldWorkerMs: roundedGeometry(pauseWorkerMs),
     hiddenDraggedLinks,
     visibleLinks: results.length,
+    aStarPops,
+    routeWindow: winEscalations,
+    routeSimple: simpleHits,
     links: entries.length,
   });
+  pauseWorkerReroutes = 0;
+  pauseWorkerMs = 0;
   return results;
 }

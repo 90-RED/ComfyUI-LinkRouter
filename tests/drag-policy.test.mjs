@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import {
   orderHeldRouteCandidates,
   pathBounds,
+  pauseRevealCount,
   shouldFreezeHiddenModeLink,
   shouldQueueIdleCleanup,
+  shouldRacePauseLink,
   shouldRouteHeldCollision,
   shouldStretchDragPath,
   shouldUseDragSettle,
@@ -111,4 +113,41 @@ test("small and medium live modes may stretch only after geometry validates the 
       `${effectiveMode} should keep a collision-free path stable`,
     );
   }
+});
+
+
+test("pause reveal drains the whole queue in one frame", () => {
+  assert.equal(pauseRevealCount(0), 0);
+  assert.equal(pauseRevealCount(-3), 0);
+  assert.equal(pauseRevealCount(1), 1);
+  assert.equal(pauseRevealCount(17), 17);
+  assert.equal(pauseRevealCount(500), 500);
+  const framesToDrain = (n) => {
+    let remaining = n;
+    let frames = 0;
+    while (remaining > 0) {
+      remaining -= Math.min(pauseRevealCount(remaining), remaining);
+      frames++;
+    }
+    return frames;
+  };
+  // Pacing was removed: measured pauses last ~100-130ms, so trickled reveals
+  // never reached the tail links before the drag resumed and discarded them.
+  for (let n = 1; n <= 500; n++)
+    assert.equal(framesToDrain(n), 1, `queue ${n} should drain in one frame`);
+});
+
+test("held-pause race only takes predicted-cheap links", () => {
+  assert.equal(shouldRacePauseLink(3, 8, 10), true);
+  assert.equal(shouldRacePauseLink(9.9, 8, 10), true);
+  assert.equal(shouldRacePauseLink(10, 8, 10), false); // boundary: not cheaper
+  assert.equal(shouldRacePauseLink(42, 8, 10), false);
+  // Unknown links fall back to the session average (usually cheap).
+  assert.equal(shouldRacePauseLink(undefined, 8, 10), true);
+  assert.equal(shouldRacePauseLink(undefined, 10, 10), false);
+  // The race call site now passes an infinite fallback: links without a
+  // main-thread-measured cost are never raced (worker timings and session
+  // averages mis-predicted 19-49ms routes as cheap).
+  assert.equal(shouldRacePauseLink(undefined, Infinity, 10), false);
+  assert.equal(shouldRacePauseLink(3, Infinity, 10), true);
 });

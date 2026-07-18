@@ -58,6 +58,7 @@ app.registerExtension({
       M._dragPauseCleanupLinkIds.clear();
       M._dragPauseAttemptedLinkIds.clear();
       M._dragPauseCompletedLinkIds.clear();
+      M._dragPauseRevealQueue.length = 0;
       M._dragInterruptedBatch = false;
     };
     const releasePointer = () => { M._pointerDown = false; };

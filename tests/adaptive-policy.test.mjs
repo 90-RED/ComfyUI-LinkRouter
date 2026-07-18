@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   chooseAdaptiveDragMode,
   escalateDragModeAfterFrame,
+  escalateLockedDragMode,
   liveCollisionBudget,
   lockAdaptiveDragMode,
   shouldActivateHeavyDrag,
@@ -98,4 +99,22 @@ test("an actually slow drag frame escalates only the following frames", () => {
   assert.equal(escalateDragModeAfterFrame("freeze-others", 100, 15), "freeze-others");
   assert.equal(escalateDragModeAfterFrame("freeze-others", 50, 20), "freeze-others-strict");
   assert.equal(escalateDragModeAfterFrame("none", 100, 20), "hide-self");
+});
+
+test("locked drag mode escalates one-way on measured cost (never downgrades mid-gesture)", () => {
+  // 2026-07-18 profile: freeze-others pinned for 6.5s at 60-116ms frames
+  // because predictedMs underestimated the real connector cost 2-4x.
+  assert.equal(escalateLockedDragMode("freeze-others", 81, 56), "freeze-others-strict");
+  assert.equal(escalateLockedDragMode("freeze-others-strict", 85, 56), "hide-self");
+  assert.equal(escalateLockedDragMode("freeze-others", 116, 56), "hide-self");
+  // Fast frames keep the locked mode.
+  assert.equal(escalateLockedDragMode("freeze-others", 12, 56), "freeze-others");
+  // Never downgrades, even where escalateDragModeAfterFrame alone would.
+  assert.equal(escalateLockedDragMode("hide-self", 3, 4), "hide-self");
+  assert.equal(escalateLockedDragMode("freeze-others-strict", 8, 3), "freeze-others-strict");
+  // Small active sets keep live avoidance: never past freeze-others.
+  assert.equal(escalateLockedDragMode("freeze-others", 100, 12), "freeze-others");
+  // Null / adaptive pass through untouched.
+  assert.equal(escalateLockedDragMode(null, 100, 56), null);
+  assert.equal(escalateLockedDragMode("adaptive", 100, 56), "adaptive");
 });

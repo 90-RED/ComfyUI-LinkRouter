@@ -97,21 +97,82 @@ function strokeCachedPath(ctx, cached) {
 }
 
 let staticBatchCache = null;
-function staticBatches(canvas, routed) {
+
+// Memoized 32-bit hash per color string — color values repeat heavily
+// across links, so per-link hashing is just one Map lookup + one imul.
+const colorCodeCache = new Map();
+function colorCode(color) {
+  let v = colorCodeCache.get(color);
+  if (v === undefined) {
+    v = 1;
+    for (let c = 0; c < color.length; c++)
+      v = Math.imul(v ^ color.charCodeAt(c), 16777619);
+    colorCodeCache.set(color, v);
+  }
+  return v;
+}
+
+// --- viewport culling ---
+//
+// linkBounds/cullRectFor are exact: a stroked path can only reach its point
+// bounds plus half the stroke width, so skipping out-of-rect links can never
+// remove a visible pixel. The rect is snapped OUTWARD to 128px so small pans
+// keep hitting the batch cache (the cached batch is a superset of the view).
+
+function linkBounds(cached) {
+  if (cached._pb && cached._pb.pts === cached.pts) return cached._pb;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of cached.pts) {
+    if (p.x < x0) x0 = p.x;
+    if (p.y < y0) y0 = p.y;
+    if (p.x > x1) x1 = p.x;
+    if (p.y > y1) y1 = p.y;
+  }
+  const b = { pts: cached.pts, x0, y0, x1, y1 };
+  cached._pb = b;
+  return b;
+}
+
+const CULL_SNAP = 128;
+function cullRectFor(canvas) {
+  // canvas.visible_area is litegraph's Rectangle [x, y, w, h] in graph
+  // coordinates (verified in frontend 1.45.21: LGraphCanvas.visible_area ===
+  // DragAndScale.visible_area, resized via resizeBottomRight).
+  const va = canvas.visible_area;
+  if (!va || va.length < 4 || !(va[2] > 0) || !(va[3] > 0)) return null;
+  const m = (+M.S.lineWidth || 3) + (+M.S.outlineWidth || 2) + 2;
+  return {
+    x0: Math.floor((va[0] - m) / CULL_SNAP) * CULL_SNAP,
+    y0: Math.floor((va[1] - m) / CULL_SNAP) * CULL_SNAP,
+    x1: Math.ceil((va[0] + va[2] + m) / CULL_SNAP) * CULL_SNAP,
+    y1: Math.ceil((va[1] + va[3] + m) / CULL_SNAP) * CULL_SNAP,
+  };
+}
+
+function boundsOutside(b, r) {
+  return b.x1 < r.x0 || b.x0 > r.x1 || b.y1 < r.y0 || b.y0 > r.y1;
+}
+
+function staticBatches(canvas, routed, cull) {
   const profileStarted = profiler.active ? performance.now() : 0;
   if (typeof Path2D === "undefined" || typeof Path2D.prototype.addPath !== "function") return null;
   const colors = [];
-  let colorSig = "";
+  let colorHash = 0x811c9dc5;
   for (const { entry } of routed) {
     const color = linkColor(canvas, entry.link);
     colors.push(color);
-    colorSig += entry.link.id + ":" + color + ";";
+    colorHash = Math.imul(
+      colorHash ^ ((entry.link.id | 0) ^ colorCode(color)),
+      16777619,
+    );
   }
   const pathKey = M.S.cornerMode + "|" + M.S.cornerRadius;
+  const cullKey = cull ? cull.x0 + "," + cull.y0 + "," + cull.x1 + "," + cull.y1 : "";
   if (
     staticBatchCache?.routed === routed &&
     staticBatchCache.pathKey === pathKey &&
-    staticBatchCache.colorSig === colorSig
+    staticBatchCache.colorHash === colorHash &&
+    staticBatchCache.cullKey === cullKey
   ) {
     if (profiler.active)
       profiler.recordBatch({ hit: true, durationMs: Math.round((performance.now() - profileStarted) * 1000) / 1000 });
@@ -122,6 +183,12 @@ function staticBatches(canvas, routed) {
   const byColor = new Map();
   for (let i = 0; i < routed.length; i++) {
     const { entry, cached } = routed[i];
+    const pts = cached.pts;
+    // Keep every link's center fresh for litegraph's tooltip hit-testing,
+    // even for links culled out of the current viewport.
+    const mid = pts[Math.floor(pts.length / 2)];
+    entry.link._pos && ((entry.link._pos[0] = mid.x), (entry.link._pos[1] = mid.y));
+    if (cull && boundsOutside(linkBounds(cached), cull)) continue;
     const path = cachedCanvasPath(cached);
     if (!path) return null;
     all.addPath(path);
@@ -132,11 +199,8 @@ function staticBatches(canvas, routed) {
       byColor.set(color, batch);
     }
     batch.addPath(path);
-    const pts = cached.pts;
-    const mid = pts[Math.floor(pts.length / 2)];
-    entry.link._pos && ((entry.link._pos[0] = mid.x), (entry.link._pos[1] = mid.y));
   }
-  staticBatchCache = { routed, pathKey, colorSig, all, byColor };
+  staticBatchCache = { routed, pathKey, colorHash, cullKey, all, byColor };
   if (profiler.active)
     profiler.recordBatch({ hit: false, durationMs: Math.round((performance.now() - profileStarted) * 1000) / 1000 });
   return staticBatchCache;
@@ -224,24 +288,144 @@ function drawFlow(ctx, cached, t, baseColor, alpha, staticArrows = false) {
   ctx.restore();
 }
 
+// --- overlay animation layer ---
+//
+// Animated flow markers render on a separate <canvas> stacked above the main
+// canvas, so the ~30fps animation no longer forces a full graph redraw
+// (setDirty) every frame — only the small overlay is repainted.
+// Verified against frontend 1.45.21: the main canvas backing store is sized
+// in CSS pixels (LGraphCanvas.resize uses parentElement.offsetWidth/Height),
+// and the ctx transform during drawConnections is ds.toCanvasContext(ctx)
+// (= scale(s,s) then translate(offset)). The frontend's own overlay uses the
+// same recipe: setTransform(width/clientWidth) + ds.toCanvasContext.
+
+function overlayUsable() {
+  return (
+    M.S.animOverlay !== false &&
+    !M._overlayFailed &&
+    typeof document !== "undefined"
+  );
+}
+
+function ensureOverlay(main) {
+  let ov = M._overlayCanvas;
+  try {
+    if (!ov) {
+      ov = document.createElement("canvas");
+      ov.dataset.linkrouterOverlay = "1";
+      ov.style.cssText =
+        "position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;";
+      M._overlayCanvas = ov;
+      M._overlayCtx = ov.getContext("2d");
+      if (!M._overlayCtx) throw new Error("2d context unavailable");
+    }
+    const parent = main?.parentElement;
+    if (!parent) return null;
+    if (ov.parentElement !== parent) {
+      // The 100%-sized overlay aligns with the main canvas only when the
+      // parent is a positioned ancestor (main canvas == parent size).
+      if (getComputedStyle(parent).position === "static")
+        parent.style.position = "relative";
+      parent.appendChild(ov);
+    }
+    return ov;
+  } catch (e) {
+    M._overlayFailed = true;
+    console.warn("[LinkRouter] overlay layer unavailable, legacy animation", e);
+    return null;
+  }
+}
+
+function clearOverlay() {
+  const ov = M._overlayCanvas;
+  const octx = M._overlayCtx;
+  if (!ov || !octx) return;
+  try {
+    octx.setTransform(1, 0, 0, 1, 0, 0);
+    octx.clearRect(0, 0, ov.width, ov.height);
+  } catch {}
+}
+
+function drawOverlayFrame(lgCanvas) {
+  const main = lgCanvas?.canvas;
+  if (!main || !ensureOverlay(main)) return;
+  const ov = M._overlayCanvas;
+  const octx = M._overlayCtx;
+  try {
+    // Keep the overlay the top-most sibling so markers stay visible even if
+    // the frontend appends node layers later. No DOM write when already last.
+    const parent = main.parentElement;
+    if (parent && parent.lastElementChild !== ov) parent.appendChild(ov);
+    if (ov.width !== main.width || ov.height !== main.height) {
+      ov.width = main.width;
+      ov.height = main.height;
+    }
+    octx.setTransform(1, 0, 0, 1, 0, 0);
+    octx.clearRect(0, 0, ov.width, ov.height);
+    const links = M._animLinks;
+    if (!links.length) return;
+    const dpr = main.width / (main.clientWidth || main.width || 1);
+    octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const ds = lgCanvas.ds;
+    if (ds) {
+      if (typeof ds.toCanvasContext === "function") ds.toCanvasContext(octx);
+      else {
+        octx.scale(ds.scale, ds.scale);
+        octx.translate(ds.offset[0], ds.offset[1]);
+      }
+    }
+    octx.lineJoin = "round";
+    octx.lineCap = "round";
+    const t = performance.now() / 1000;
+    for (const it of links)
+      drawFlow(octx, it.cached, t, it.color, it.alpha, false);
+  } catch (e) {
+    M._overlayFailed = true;
+    console.warn("[LinkRouter] overlay draw failed, legacy animation", e);
+  }
+}
+
 // --- animation loop ---
 
-function ensureAnimLoop(need) {
-  if (need && !M.animActive) {
-    M.animActive = true;
-    const tick = (now) => {
-      if (!M.animActive) return;
-      const interval = 1000 / M.currentFPS();
-      if (now - M.lastFrame >= interval) {
-        M.lastFrame = now;
-        app.canvas?.setDirty(true, true);
+function stopAnimLoop() {
+  M.animActive = false;
+  if (M.rafId) cancelAnimationFrame(M.rafId);
+  M.rafId = 0;
+}
+
+function animTick(now) {
+  if (!M.animActive) return;
+  const interval = 1000 / M.currentFPS();
+  if (now - M.lastFrame >= interval) {
+    M.lastFrame = now;
+    if (M._overlayLoop) {
+      // Overlay mode: repaint only the overlay layer. Self-terminate when the
+      // plugin got disabled (drawAll no longer runs to stop us) or the
+      // overlay failed (next drawAll will restart the legacy loop).
+      if (M.S.enabled === false || M._overlayFailed) {
+        stopAnimLoop();
+        clearOverlay();
+        return;
       }
-      M.rafId = requestAnimationFrame(tick);
-    };
-    M.rafId = requestAnimationFrame(tick);
-  } else if (!need && M.animActive) {
-    M.animActive = false;
-    cancelAnimationFrame(M.rafId);
+      drawOverlayFrame(app.canvas);
+    } else {
+      app.canvas?.setDirty(true, true);
+    }
+  }
+  M.rafId = requestAnimationFrame(animTick);
+}
+
+function ensureAnimLoop(need, useOverlay) {
+  if (need && M.animActive && M._overlayLoop === useOverlay) return;
+  const wasActive = M.animActive;
+  const wasOverlay = M._overlayLoop;
+  if (wasActive) stopAnimLoop();
+  if (wasOverlay) clearOverlay(); // never leave a stale overlay frame behind
+  if (need) {
+    M.animActive = true;
+    M._overlayLoop = useOverlay;
+    M.lastFrame = 0;
+    M.rafId = requestAnimationFrame(animTick);
   }
 }
 
@@ -263,7 +447,14 @@ function hoverNodeId(canvas) {
   const scale = canvas.ds.scale || 1;
   const gx = (M.mouseClient.x - rect.left) / scale - canvas.ds.offset[0];
   const gy = (M.mouseClient.y - rect.top) / scale - canvas.ds.offset[1];
-  const nodes = canvas.graph?._nodes || [];
+  const graph = canvas.graph;
+  // Prefer litegraph's own spatial query over the already-computed
+  // visible_nodes list instead of scanning every node with getBounding.
+  if (graph && typeof graph.getNodeOnPos === "function") {
+    const n = graph.getNodeOnPos(gx, gy, canvas.visible_nodes || graph._nodes);
+    return n ? n.id : null;
+  }
+  const nodes = graph?._nodes || [];
   for (let i = nodes.length - 1; i >= 0; i--) {
     const r = nodeRect(nodes[i]);
     if (gx >= r.x && gx <= r.x + r.w && gy >= r.y && gy <= r.y + r.h)
@@ -304,6 +495,15 @@ export function drawAll(canvas, ctx) {
     hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId);
   const animOK = M.animEnabledNow();
 
+  // Overlay mode: animated markers are collected during the main pass and
+  // drawn on the overlay layer afterwards (and by the rAF tick), instead of
+  // being painted into the main canvas with a 30fps full redraw.
+  M._animLinks.length = 0;
+  const useOverlay =
+    M.S.flowMode === "animated" &&
+    overlayUsable() &&
+    !!ensureOverlay(canvas.canvas);
+
   let animOn = false;
   let strokeCalls = 0;
   const t = performance.now() / 1000;
@@ -314,11 +514,22 @@ export function drawAll(canvas, ctx) {
   // Hover must not switch the entire workflow from color batches to per-link
   // drawing. Keep the unchanged batch as the base and overlay only links
   // attached to the hovered node so they genuinely render on top.
-  const batches = !hasSel ? staticBatches(canvas, routed) : null;
+  // Low-zoom LOD (mirrors the frontend's own low-quality mode): when zoomed
+  // far out, outlines and flow markers are visually indistinguishable but
+  // still cost stroke/fill time — skip them. canvas.low_quality is the
+  // frontend 1.45.21 getter (scale < min_font_size_for_lod/(text size*√dpr));
+  // fall back to a fixed 0.6 threshold on older frontends.
+  const lowQ =
+    canvas.low_quality === true ||
+    (canvas.low_quality === undefined && (canvas.ds?.scale ?? 1) < 0.6);
+  const wantOutline = M.S.outline && !lowQ;
+
+  const cull = cullRectFor(canvas);
+  const batches = !hasSel ? staticBatches(canvas, routed, cull) : null;
   const drawItems = hoverDrawItems(routed, hoverId, !!batches);
   if (batches) {
     const w = +M.S.lineWidth || 3;
-    if (M.S.outline) {
+    if (wantOutline) {
       ctx.strokeStyle = `rgba(0,0,0,${+M.S.outlineAlpha || 0.5})`;
       ctx.lineWidth = w + (+M.S.outlineWidth || 2);
       ctx.stroke(batches.all);
@@ -334,6 +545,9 @@ export function drawAll(canvas, ctx) {
   for (const { entry, cached } of drawItems) {
     const pts = cached.pts;
     const link = entry.link;
+    const mid = pts[Math.floor(pts.length / 2)];
+    link._pos && ((link._pos[0] = mid.x), (link._pos[1] = mid.y));
+    if (cull && boundsOutside(linkBounds(cached), cull)) continue;
     const isSel = hasSel && related(link);
     const isHov = M.S.hoverAnim && hovered(link);
     let alpha = 1;
@@ -350,7 +564,7 @@ export function drawAll(canvas, ctx) {
     const w = (+M.S.lineWidth || 3) * (isSel ? +M.S.selectBoost || 1.35 : 1);
     const color = linkColor(canvas, link);
 
-    if (M.S.outline) {
+    if (wantOutline) {
       ctx.strokeStyle = `rgba(0,0,0,${+M.S.outlineAlpha || 0.5})`;
       ctx.lineWidth = w + (+M.S.outlineWidth || 2);
       strokeCachedPath(ctx, cached);
@@ -361,17 +575,15 @@ export function drawAll(canvas, ctx) {
     strokeCachedPath(ctx, cached);
     strokeCalls++;
 
-    if ((isSel && M.S.selectAnim) || isHov) {
+    if (!lowQ && ((isSel && M.S.selectAnim) || isHov)) {
       if (M.S.flowMode === "animated" && animOK) {
         animOn = true;
-        drawFlow(ctx, cached, t, color, alpha, false);
+        if (useOverlay) M._animLinks.push({ cached, color, alpha });
+        else drawFlow(ctx, cached, t, color, alpha, false);
       } else if (M.S.flowMode === "static" || (M.S.flowMode === "animated" && !animOK)) {
         drawFlow(ctx, cached, 0, color, alpha, true);
       }
     }
-
-    const mid = pts[Math.floor(pts.length / 2)];
-    link._pos && ((link._pos[0] = mid.x), (link._pos[1] = mid.y));
   }
   ctx.globalAlpha = 1;
 
@@ -386,7 +598,13 @@ export function drawAll(canvas, ctx) {
   }
   ctx.restore();
 
-  ensureAnimLoop(animOn);
+  ensureAnimLoop(animOn, useOverlay);
+  if (useOverlay) {
+    // Sync the overlay with the main canvas we just painted (pan/zoom stay
+    // glued); empty animation set means the overlay must be blank.
+    if (animOn) drawOverlayFrame(canvas);
+    else clearOverlay();
+  }
   profiler.endFrame(profileFrame, { links: routed.length, strokeCalls, batched: !!batches });
   return true;
 }
