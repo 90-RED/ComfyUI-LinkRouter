@@ -6,6 +6,7 @@
 
 import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
+import { stretchedPathCrossesUnexpectedNode } from "./router.js";
 import { stretchPathPure } from "./stretch.js";
 import { profiler } from "./profiler.js";
 import {
@@ -42,8 +43,12 @@ import {
 } from "./worker-client.js";
 
 // Subgraph boundary IO virtual node ids (ComfyUI frontend convention).
+// Frontend 1.47 turned NodeId into a runtime string (toNodeId(-10) === "-10");
+// older builds use numbers. Compare by string form so both generations match.
 const SUBGRAPH_INPUT_ID = -10;
 const SUBGRAPH_OUTPUT_ID = -20;
+const isSubgraphInputId = (id) => String(id) === String(SUBGRAPH_INPUT_ID);
+const isSubgraphOutputId = (id) => String(id) === String(SUBGRAPH_OUTPUT_ID);
 
 // --- node helpers ---
 
@@ -62,8 +67,8 @@ function cachedNodeRect(node, cache) {
 }
 
 function resolveNode(graph, id) {
-  if (id === SUBGRAPH_INPUT_ID) return graph.inputNode || null;
-  if (id === SUBGRAPH_OUTPUT_ID) return graph.outputNode || null;
+  if (isSubgraphInputId(id)) return graph.inputNode || null;
+  if (isSubgraphOutputId(id)) return graph.outputNode || null;
   return graph.getNodeById?.(id) || null;
 }
 
@@ -92,10 +97,10 @@ function collectLinks(graph) {
     const b = resolveNode(graph, link.target_id);
     if (!a || !b) {
       if (
-        link.origin_id === SUBGRAPH_INPUT_ID ||
-        link.origin_id === SUBGRAPH_OUTPUT_ID ||
-        link.target_id === SUBGRAPH_INPUT_ID ||
-        link.target_id === SUBGRAPH_OUTPUT_ID
+        isSubgraphInputId(link.origin_id) ||
+        isSubgraphOutputId(link.origin_id) ||
+        isSubgraphInputId(link.target_id) ||
+        isSubgraphOutputId(link.target_id)
       )
         ioUnresolved++;
       return;
@@ -124,11 +129,11 @@ function endpoints(entry, rectCache) {
   let p1 = null, p2 = null;
   try {
     p1 =
-      link.origin_id === SUBGRAPH_INPUT_ID
+      isSubgraphInputId(link.origin_id)
         ? ioSlotPos(a, link.origin_slot)
         : getSlotPos(a, false, link.origin_slot);
     p2 =
-      link.target_id === SUBGRAPH_OUTPUT_ID
+      isSubgraphOutputId(link.target_id)
         ? ioSlotPos(b, link.target_slot)
         : getSlotPos(b, true, link.target_slot);
   } catch {
@@ -675,8 +680,17 @@ const PAUSE_RACE_MAX_MS = 10;
 
 let pauseWorkerReroutes = 0;
 let pauseWorkerMs = 0;
+// Set when a held-pause worker batch fails or times out: pause routing stays
+// on the main thread for the rest of the session (stable batches still use
+// the worker). A worker that swallowed one pause batch would likely swallow
+// the next, and re-dispatching would just loop errors.
+let pauseWorkerDisabled = false;
 
-function cancelDragPauseWorker() {
+// Exported for smart-edge.js: a new pointer gesture must cancel the previous
+// gesture's still-flying pause batch, or its late results pass the jobRev
+// check into the new reveal queue and the stale _dragPauseWorker blocks the
+// next pause dispatch.
+export function cancelDragPauseWorker() {
   if (!M._dragPauseWorker) return;
   M._dragPauseWorker = null;
   cancelWorkerBatch();
@@ -708,6 +722,8 @@ function tryDispatchDragPauseWorker(graph, fastSig, entries, rectCache) {
   M._dragPauseWorker = {
     jobRev,
     jobsById: new Map(jobs.map((j) => [j.entry.link.id, j])),
+    graph,
+    entries,
   };
   return true;
 }
@@ -733,6 +749,33 @@ function handleDragPauseWorkerResult(msg) {
     // Do not draw mid-pump: queue the path for the reveal pass below, which
     // drains on the next frame (fast-hit is suppressed while it is non-empty).
     M._dragPauseRevealQueue.push({ linkId, cached });
+  } else if (msg.error) {
+    // Single-job exception on the worker: re-route just this link on the
+    // main thread with the same opts (bit-identical inputs); the rest of
+    // the pause batch is unaffected.
+    ensureMainRouterFresh(M._dragPauseWorker.graph, M._dragPauseWorker.entries, new Map());
+    let pts = null;
+    const started = performance.now();
+    try {
+      pts = M.router.routeConnector(
+        job.ep.out,
+        job.ep.bodyOut,
+        job.ep.stubOut,
+        job.ep.stubIn,
+        job.ep.bodyIn,
+        job.ep.inp,
+        job.opts || undefined,
+      );
+    } catch {}
+    rememberRouteCost(linkId, performance.now() - started, true);
+    if (pts) {
+      M.failedRoutes.delete(linkId);
+      const cached = { ends: job.endsKey, sticky: false };
+      setCachedPath(cached, pts);
+      M._dragPauseRevealQueue.push({ linkId, cached });
+    } else {
+      rememberRouteFailure(linkId, job.endsKey, job.ep);
+    }
   } else {
     // Same bookkeeping as the main-thread drain: negative-cache the failure;
     // the link keeps its frozen/hidden placeholder until the release pass.
@@ -799,7 +842,15 @@ initWorkerClient({
       batch.simpleHits += msg.stats.simple || 0;
       if (msg.stats.level > 1) batch.winEscalations++;
     }
-    if (msg.ok && msg.buf) {
+    if (msg.error) {
+      // Single-job exception on the worker: re-route just this link on the
+      // main thread (bit-identical inputs/opts); the rest of the worker
+      // batch is unaffected. The main router build may have been deferred
+      // on this worker frame — force it now.
+      ensureMainRouterFresh(batch.graph, batch.entries, new Map());
+      const { result } = executeRouteJob(batch, job);
+      if (result) batch.resultsById.set(msg.id, result);
+    } else if (msg.ok && msg.buf) {
       const pts = [];
       for (let i = 0; i < msg.buf.length; i += 2)
         pts.push({ x: msg.buf[i], y: msg.buf[i + 1] });
@@ -854,6 +905,37 @@ initWorkerClient({
       M.routeBatch = null;
       app.canvas?.setDirty(true, true);
     }
+  },
+  // Batch-level worker error (e.g. graph build threw): degrade just this
+  // batch — the worker itself stays enabled unless worker-client sees too
+  // many consecutive failures (workerErrorAction backstop).
+  onBatchError(msg) {
+    if (M._dragPauseWorker && msg.jobRev === M._dragPauseWorker.jobRev) {
+      // Pause queue returns to the per-frame main-thread drain. Do not
+      // re-dispatch: a failing worker would just loop the same error.
+      pauseWorkerDisabled = true;
+      M._dragPauseWorker = null;
+      app.canvas?.setDirty(false, true);
+      return;
+    }
+    const batch = M.routeBatch;
+    if (batch?.worker && batch.jobRev === msg.jobRev) {
+      // Same rescue as a stalled worker: streamed results stay valid, the
+      // remainder continues on the main-thread progressive drain.
+      rescueWorkerBatch(batch);
+    }
+  },
+  // Held-pause watchdog (worker-client.js): the pause batch went silent.
+  // Drop it and let the main-thread pause drain take over — same degrade as
+  // a manual cancel, but pause dispatches stop for the session because a
+  // worker that swallowed one pause batch would likely swallow the next.
+  onPauseTimeout() {
+    pauseWorkerDisabled = true;
+    cancelDragPauseWorker();
+    console.warn(
+      "[LinkRouter] held-pause worker unresponsive — routing pauses on the main thread",
+    );
+    app.canvas?.setDirty(false, true);
   },
 });
 
@@ -923,6 +1005,54 @@ function finishStableRoutes(batch, results) {
   M.routeResults = results;
 }
 
+// One main-thread connector route with full bookkeeping (cost, A* stats,
+// negative cache, sticky degrade). Shared by the progressive sync drain and
+// by the worker single-job exception fallback (msg.error): a job that threw
+// on the worker is re-run here with bit-identical inputs and opts.
+function executeRouteJob(batch, job) {
+  const started = performance.now();
+  const pts = M.router.routeConnector(
+    job.ep.out,
+    job.ep.bodyOut,
+    job.ep.stubOut,
+    job.ep.stubIn,
+    job.ep.bodyIn,
+    job.ep.inp,
+    job.opts || undefined,
+  );
+  const elapsed = performance.now() - started;
+  rememberRouteCost(job.entry.link.id, elapsed, true);
+  const st = M.router.lastStats;
+  if (st) {
+    batch.aStarPops += st.pops;
+    batch.simpleHits += st.simple;
+    if (st.level > 1) batch.winEscalations++;
+  }
+  if (!pts) {
+    batch.routeFailures++;
+    rememberRouteFailure(job.entry.link.id, job.endsKey, job.ep);
+    // Degrade gracefully: keep the last legal path on screen, stretched
+    // to the current endpoints, instead of making the link vanish.
+    // stretchPath validates that no unexpected node body is crossed.
+    const stickyPts = stretchPath(
+      M.pathCache.get(job.entry.link.id)?.pts,
+      job.ep,
+    );
+    if (stickyPts) {
+      const sticky = { ends: job.endsKey, sticky: true };
+      setCachedPath(sticky, stickyPts);
+      M.pathCache.set(job.entry.link.id, sticky);
+      return { result: { entry: job.entry, cached: sticky }, elapsed };
+    }
+    return { result: null, elapsed };
+  }
+  M.failedRoutes.delete(job.entry.link.id);
+  const cached = { ends: job.endsKey, sticky: false };
+  setCachedPath(cached, pts);
+  M.pathCache.set(job.entry.link.id, cached);
+  return { result: { entry: job.entry, cached }, elapsed };
+}
+
 function continueStableRoutes(batch, profileStarted) {
   if (batch.worker) {
     // Worker batches are message-driven; frames only re-emit partial results.
@@ -930,47 +1060,9 @@ function continueStableRoutes(batch, profileStarted) {
   }
   let connectorMs = 0;
   const routeOne = (job) => {
-    const started = performance.now();
-    const pts = M.router.routeConnector(
-      job.ep.out,
-      job.ep.bodyOut,
-      job.ep.stubOut,
-      job.ep.stubIn,
-      job.ep.bodyIn,
-      job.ep.inp,
-    );
-    const elapsed = performance.now() - started;
+    const { result, elapsed } = executeRouteJob(batch, job);
     connectorMs += elapsed;
-    rememberRouteCost(job.entry.link.id, elapsed, true);
-    const st = M.router.lastStats;
-    if (st) {
-      batch.aStarPops += st.pops;
-      batch.simpleHits += st.simple;
-      if (st.level > 1) batch.winEscalations++;
-    }
-    if (!pts) {
-      batch.routeFailures++;
-      rememberRouteFailure(job.entry.link.id, job.endsKey, job.ep);
-      // Degrade gracefully: keep the last legal path on screen, stretched
-      // to the current endpoints, instead of making the link vanish.
-      // stretchPath validates that no unexpected node body is crossed.
-      const stickyPts = stretchPath(
-        M.pathCache.get(job.entry.link.id)?.pts,
-        job.ep,
-      );
-      if (stickyPts) {
-        const sticky = { ends: job.endsKey, sticky: true };
-        setCachedPath(sticky, stickyPts);
-        M.pathCache.set(job.entry.link.id, sticky);
-        return { entry: job.entry, cached: sticky };
-      }
-      return null;
-    }
-    M.failedRoutes.delete(job.entry.link.id);
-    const cached = { ends: job.endsKey, sticky: false };
-    setCachedPath(cached, pts);
-    M.pathCache.set(job.entry.link.id, cached);
-    return { entry: job.entry, cached };
+    return result;
   };
 
   const maxItems = batch.progressive
@@ -1023,8 +1115,8 @@ function prepareStableRoutes(graph, fastSig, entries, rectCache, dirty, profileS
     const ep = endpoints(entry, rectCache);
     if (!ep) {
       const io =
-        entry.link.origin_id === SUBGRAPH_INPUT_ID ||
-        entry.link.target_id === SUBGRAPH_OUTPUT_ID;
+        isSubgraphInputId(entry.link.origin_id) ||
+        isSubgraphOutputId(entry.link.target_id);
       if (io) {
         reportRouteProfile(profileStarted, {
           fastHit: false,
@@ -1311,7 +1403,6 @@ export function routeAll(graph) {
     M._pointerDown
   )
     effectiveMode = "hide-self";
-  M._lastDragMode = effectiveMode;
 
   if (M._dragPauseActive && M._dragPauseQueue === null) {
     const primaryCandidates = [];
@@ -1368,6 +1459,7 @@ export function routeAll(graph) {
     M._dragPauseActive &&
     M._dragPauseQueue?.length &&
     !M._dragPauseWorker &&
+    !pauseWorkerDisabled &&
     M.S.workerHeldPause !== false
   ) {
     tryDispatchDragPauseWorker(graph, fastSig, entries, rectCache);
@@ -1423,6 +1515,31 @@ export function routeAll(graph) {
   let winEscalations = 0;
   let simpleHits = 0;
   const collisionBudget = liveCollisionBudget(effectiveMode, draggedLinkIds.size);
+
+  // Corridor hysteresis (anti-flicker): body-level rects of every node, built
+  // lazily once per frame. An unrelated link whose current path still clears
+  // every node BODY keeps it verbatim — hitDirty fires on the moved node's
+  // old+new bounding rects, so it includes positions the node already vacated
+  // and margin zones it has not reached, both of which made A* re-pick
+  // corridors frame to frame (visible route flicker). Validation is far
+  // cheaper than the search it skips, and a re-route still fires the very
+  // frame the dragged node's body actually touches the path, so the live
+  // avoidance feedback is unchanged. Gated by the same stickiness setting as
+  // the drag stretch below.
+  let hysteresisNodes = null;
+  let hysteresisRects = null;
+  const dragPathStillClear = (entry, pts) => {
+    if (!hysteresisRects) {
+      hysteresisNodes = graph._nodes || [];
+      hysteresisRects = hysteresisNodes.map((n) => cachedNodeRect(n, rectCache));
+    }
+    return !stretchedPathCrossesUnexpectedNode(
+      pts,
+      hysteresisRects,
+      hysteresisNodes.indexOf(entry.a),
+      hysteresisNodes.indexOf(entry.b),
+    );
+  };
 
   for (const e of entries) {
     let pauseRoute = false;
@@ -1520,8 +1637,8 @@ export function routeAll(graph) {
     const ep = endpoints(e, rectCache);
     if (!ep) {
       const io =
-        e.link.origin_id === SUBGRAPH_INPUT_ID ||
-        e.link.target_id === SUBGRAPH_OUTPUT_ID;
+        isSubgraphInputId(e.link.origin_id) ||
+        isSubgraphOutputId(e.link.target_id);
       if (io) {
         reportRouteProfile(profileStarted, {
           fastHit: false,
@@ -1544,6 +1661,21 @@ export function routeAll(graph) {
     const hitDirty = collisionLinkIds.has(e.link.id);
 
     if (endsMoved || hitDirty || pauseRoute) {
+      // Corridor hysteresis keep: unchanged ends, path still clear of every
+      // node body → keep the path exactly as-is (same bookkeeping as the
+      // no-reroute path below) instead of letting A* re-pick a corridor.
+      if (
+        hitDirty &&
+        !endsMoved &&
+        !pauseRoute &&
+        M.S.stickiness &&
+        cached?.pts &&
+        dragPathStillClear(e, cached.pts)
+      ) {
+        finishPauseRoute(!!cached?.pts, cached);
+        results.push({ entry: e, cached });
+        continue;
+      }
       // Same negative-cache rule as the stable path: a link that failed
       // under these endpoints does not retry until backoff elapses or the
       // geometry near it changed. Held-pause routes bypass the cache
@@ -1666,7 +1798,9 @@ export function routeAll(graph) {
         ? "worker-routing-off"
         : M.S.workerHeldPause === false
           ? "held-pause-off"
-          : "on",
+          : pauseWorkerDisabled
+            ? "pause-worker-degraded"
+            : "on",
     heldWorkerReroutes: pauseWorkerReroutes,
     heldWorkerMs: roundedGeometry(pauseWorkerMs),
     hiddenDraggedLinks,

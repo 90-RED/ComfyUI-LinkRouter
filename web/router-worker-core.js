@@ -12,9 +12,12 @@
 //    {weight, popsBudget} the main-thread drag drain uses)
 //   { type:"cancel" }
 // Protocol (worker -> main):
-//   { type:"result", jobRev, id, ok, sticky, buf: Float32Array|null, stats, ms }
+//   { type:"result", jobRev, id, ok, sticky, buf: Float32Array|null, stats, ms,
+//     error?: string }  — error marks a single-job exception: the main thread
+//     re-routes just that link, the batch is otherwise unaffected.
 //   { type:"done", jobRev }
-//   { type:"error", jobRev, message }
+//   { type:"error", jobRev, message }  — batch-level only (graph build failed);
+//     the main thread degrades that batch, not the whole worker.
 //
 // Work is chunked (CHUNK_MS per macrotask) so "cancel" and newer "route"
 // messages are handled promptly; newest route always wins.
@@ -113,25 +116,43 @@ export function createEngine(post, now = () => performance.now()) {
         while (i < job.jobs.length && !cancelRequested && !pending) {
           const j = job.jobs[i++];
           const started = now();
-          let out;
+          let out = null;
+          let error = null;
           try {
             out = routeOne(j);
           } catch (e) {
-            post({ type: "error", jobRev: job.jobRev, message: String(e?.message || e) });
-            break;
+            // Single-job exception: degrade just this link. The main thread
+            // re-routes it synchronously (msg.error); the batch and the
+            // worker survive — only whole-batch build failures post
+            // type:"error" now.
+            error = String(e?.message || e);
           }
           const ms = now() - started;
-          const msg = {
-            type: "result",
-            jobRev: job.jobRev,
-            id: j.id,
-            ok: !!out.buf,
-            sticky: out.sticky,
-            buf: out.buf,
-            stats: out.stats,
-            ms,
-          };
-          post(msg, out.buf ? [out.buf.buffer] : undefined);
+          if (error !== null) {
+            post({
+              type: "result",
+              jobRev: job.jobRev,
+              id: j.id,
+              ok: false,
+              sticky: false,
+              buf: null,
+              stats: null,
+              ms,
+              error,
+            });
+          } else {
+            const msg = {
+              type: "result",
+              jobRev: job.jobRev,
+              id: j.id,
+              ok: !!out.buf,
+              sticky: out.sticky,
+              buf: out.buf,
+              stats: out.stats,
+              ms,
+            };
+            post(msg, out.buf ? [out.buf.buffer] : undefined);
+          }
           if (now() - chunkStart >= CHUNK_MS) {
             await yieldTask();
             chunkStart = now();

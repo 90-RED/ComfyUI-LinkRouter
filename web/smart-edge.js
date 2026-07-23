@@ -12,6 +12,7 @@ import { M } from "./state.js";
 import { registerSettings, setRefreshBar } from "./settings.js";
 import { drawAll } from "./draw.js";
 import { buildUI, refreshBar, watchHover, linksHidden } from "./ui.js";
+import { cancelDragPauseWorker } from "./routing.js";
 
 // Wire the refresh-bar callback (settings.js => ui.js without circular import)
 setRefreshBar(refreshBar);
@@ -45,6 +46,10 @@ app.registerExtension({
     watchExecution();
     // Capture-phase tracking still sees gestures captured by Nodes 2.0.
     const beginPointer = () => {
+      // A new gesture orphans the previous gesture's in-flight pause batch:
+      // its late results would pass the jobRev check into the new reveal
+      // queue, and a stale _dragPauseWorker would block the next dispatch.
+      cancelDragPauseWorker();
       M._pointerDown = true;
       M._nodeDragActive = false;
       M._dragAdaptiveMode = null;
@@ -74,7 +79,12 @@ app.registerExtension({
     const proto = LGraphCanvas.prototype;
     const original = proto.drawConnections;
     proto.drawConnections = function (ctx) {
-      if (linksHidden(this)) return; // official "hide links" wins
+      // Mirror the native contract even on early exits: a frame that draws
+      // no links must leave an empty hit-test set (LGraphCanvas.ts:5977).
+      if (linksHidden(this)) {
+        this.renderedPaths?.clear?.();
+        return; // official "hide links" wins
+      }
       if (!M.S.enabled) return original.call(this, ctx);
       if (drawAll(this, ctx) === false) return original.call(this, ctx);
     };

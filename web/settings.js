@@ -152,6 +152,19 @@ const SETTINGS = {
     { min: 0.5, max: 16, step: 0.5 },
   ],
   animFPS: ["LinkRouter.Marker Animation.MaxFPS", "Animation max FPS (lower = less CPU)", "slider", 30, { min: 5, max: 60, step: 1 }],
+  animAdaptive: [
+    "LinkRouter.Marker Animation.AdaptiveDensity",
+    "Reduce marker density when many links animate at once",
+    "boolean",
+    true,
+  ],
+  animAdaptiveThreshold: [
+    "LinkRouter.Marker Animation.AdaptiveThreshold",
+    "Adaptive density: max animated links at full density",
+    "slider",
+    10,
+    { min: 2, max: 100, step: 1 },
+  ],
   animDuringRun: [
     "LinkRouter.Marker Animation.WhileRunning",
     "Animation while workflow is running",
@@ -230,6 +243,8 @@ function applySetting(key, v) {
   // color widgets on some frontends return hex without the leading "#"
   if (key === "animColor" && typeof M.S[key] === "string" && /^[0-9a-f]{3,8}$/i.test(M.S[key]))
     M.S[key] = "#" + M.S[key];
+  // Manual re-enable clears the failsafe marker (draw.js notifyRouteFailsafe).
+  if (key === "enabled" && M.S.enabled) M.routeFailsafeReason = null;
   if (M.ROUTER_KEYS.has(key)) M.resetRouter();
   else app.canvas?.setDirty(true, true);
   if ((key === "showButton" || key === "showDebugButton") && M.uiBox) maybeRefreshBar();
@@ -278,17 +293,18 @@ function registerSettings() {
       id: "LinkRouter.General.AAResetDefaults",
       name: "Reset all LinkRouter settings to defaults",
       type: () => {
-        const row = document.createElement("tr");
-        const cell = document.createElement("td");
-        cell.colSpan = 2;
+        // 1.45.x renders custom setting types inside a flex <div>
+        // (CustomFormValue.vue / FormItem.vue); the old <tr><td> markup only
+        // laid out correctly in the legacy table-based settings dialog.
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;justify-content:flex-end;";
         const btn = document.createElement("button");
         btn.textContent = "↩ Reset LinkRouter to defaults";
         btn.style.cssText = "padding:4px 12px;cursor:pointer;";
         btn.onclick = () => {
           if (confirm("Reset all LinkRouter settings to defaults?")) resetAllSettings();
         };
-        cell.appendChild(btn);
-        row.appendChild(cell);
+        row.appendChild(btn);
         return row;
       },
       defaultValue: false,
@@ -320,29 +336,40 @@ function resetAllSettings() {
   maybeRefreshBar();
 }
 
-// Best-effort visual cue: dim inactive clearance sliders
+// Best-effort visual cue: dim inactive clearance sliders.
+//
+// The 1.45.x settings dialog labels every control with a deterministic id
+// (`${setting.id}-label`, FormItem.vue), so rows are located by id and the
+// row element is cached — no more scanning page text. Refs are re-resolved
+// when the dialog re-renders (a cached node becomes disconnected). The
+// legacy table dialog has no such ids: dimming is a no-op there.
+const clearanceRowRefs = new Map();
+function clearanceRow(settingId) {
+  let row = clearanceRowRefs.get(settingId) || null;
+  if (row && !row.isConnected) row = null;
+  if (!row) {
+    const label = document.getElementById(settingId + "-label");
+    // FormItem.vue: label span lives inside .form-label; its parent is the row.
+    row = label?.closest(".form-label")?.parentElement || null;
+    if (row) clearanceRowRefs.set(settingId, row);
+  }
+  return row;
+}
+
 function updateClearanceRows() {
   try {
     const uniformOn = M.S.marginMode === "uniform";
-    const dim = (labelText, on) => {
-      const nodes = document.querySelectorAll("div, td, label, span");
-      for (const el of nodes) {
-        if (el.childElementCount > 4) continue;
-        if (el.textContent?.trim() === labelText) {
-          const row = el.closest("tr, .setting-item, .p-card, div[class*='setting']") || el.parentElement;
-          if (row) {
-            row.style.opacity = on ? "1" : "0.35";
-            row.style.pointerEvents = on ? "" : "none";
-          }
-          break;
-        }
-      }
+    const dim = (settingId, on) => {
+      const row = clearanceRow(settingId);
+      if (!row) return;
+      row.style.opacity = on ? "1" : "0.35";
+      row.style.pointerEvents = on ? "" : "none";
     };
-    dim("Clearance (uniform)", uniformOn);
-    dim("Clearance left", !uniformOn);
-    dim("Clearance right", !uniformOn);
-    dim("Clearance top", !uniformOn);
-    dim("Clearance bottom", !uniformOn);
+    dim("LinkRouter.Routing.Clearance", uniformOn);
+    dim("LinkRouter.Routing.ClearanceLeft", !uniformOn);
+    dim("LinkRouter.Routing.ClearanceRight", !uniformOn);
+    dim("LinkRouter.Routing.ClearanceTop", !uniformOn);
+    dim("LinkRouter.Routing.ClearanceBottom", !uniformOn);
   } catch {}
 }
 

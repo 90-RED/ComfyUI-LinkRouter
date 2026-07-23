@@ -12,6 +12,7 @@ import {
   FIXED_DRAG_MODES,
   isFixedDragMode,
 } from "./ui-policy.js";
+import { linkIdAtPoint, slotLinkIdsAt } from "./draw-policy.js";
 
 // ---------------------------------------------------- link mode helpers
 
@@ -53,14 +54,11 @@ function setOfficialLinkMode(v) {
 // ---------------------------------------------------- settings dialog
 
 // Open ComfyUI settings, directly on the LinkRouter panel when possible.
+// 1.45.x: the official path is the Comfy.ShowSettingsDialog command
+// (useCoreCommands.ts); app.ui.settings.show() only opens an empty legacy
+// dialog shell (scripts/ui/settings.ts is a deprecated compat shim), so those
+// fallbacks were removed.
 function openSettings() {
-  try {
-    const dlg = app.extensionManager?.dialog;
-    if (dlg?.showSettingsDialog) {
-      dlg.showSettingsDialog({ props: { defaultPanel: "LinkRouter" } });
-      return;
-    }
-  } catch {}
   try {
     const cmds = app.extensionManager?.command;
     if (cmds?.execute) {
@@ -78,11 +76,9 @@ function openSettings() {
     }
   } catch {}
   try {
-    if (app.ui?.settings?.show) { app.ui.settings.show(); return; }
-  } catch {}
-  try {
-    if (app.ui?.settings?.element) {
-      app.ui.settings.element.style.display = "block";
+    const dlg = app.extensionManager?.dialog;
+    if (dlg?.showSettingsDialog) {
+      dlg.showSettingsDialog({ props: { defaultPanel: "LinkRouter" } });
       return;
     }
   } catch {}
@@ -152,6 +148,10 @@ export function refreshBar() {
   M.barRefs.overlayBtn.title = "Routing debug overlay: " + (M.barState.debug ? "ON" : "OFF");
   M.barRefs.setActive(M.barRefs.flowBtn, M.S.flowMode !== "none");
   M.barRefs.flowBtn.title = "Flow markers: " + (M.S.flowMode !== "none" ? "ON" : "OFF");
+  const animThr = +M.S.animAdaptiveThreshold || 10;
+  M.barRefs.setActive(M.barRefs.densityBtn, M.S.animAdaptive !== false);
+  M.barRefs.densityBtn.title = "Adaptive marker density: " + (M.S.animAdaptive !== false ? "ON" : "OFF") +
+    " (>" + animThr + " animated links → half, >" + (animThr * 3) + " → 20%)";
   M.barRefs.setActive(M.barRefs.hoverBtn, M.S.hoverAnim);
   M.barRefs.hoverBtn.title = "Hover animation: " + (M.S.hoverAnim ? "ON" : "OFF");
   M.barRefs.setActive(M.barRefs.selectBtn, M.S.selectAnim);
@@ -282,6 +282,7 @@ export function buildUI() {
   const handle     = mkBtn("✥", "Move bar");
   const overlayBtn = mkBtn("🟥", "Routing debug overlay");
   const flowBtn    = mkBtn("✨", "Flow markers on/off");
+  const densityBtn = mkBtn("🎚️", "Adaptive marker density on/off");
   const hoverBtn   = mkBtn("🖱️", "Hover animation on/off");
   const selectBtn  = mkBtn("🎯", "Selection animation on/off");
   const outlineBtn = mkBtn("◉", "Line outline on/off");
@@ -292,7 +293,7 @@ export function buildUI() {
   const escalateBtn = mkBtn("📈", "Adaptive measured-lag escalation on/off");
   const recordBtn  = mkBtn("⏺", "Record performance");
   const durBtn     = mkBtn((M.barState.recordSeconds || 30) + "s", "Profiler duration: click to cycle 15 / 30 / 45 seconds");
-  for (const b of [overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn]) {
+  for (const b of [overlayBtn, flowBtn, densityBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn]) {
     b.style.fontSize = "16px";
     b.style.padding = "7px 9px";
   }
@@ -346,6 +347,7 @@ export function buildUI() {
       setPluginSetting("flowMode", "none");
     }
   };
+  densityBtn.onclick = () => setPluginSetting("animAdaptive", M.S.animAdaptive === false);
   hoverBtn.onclick = () => setPluginSetting("hoverAnim", !M.S.hoverAnim);
   selectBtn.onclick = () => setPluginSetting("selectAnim", !M.S.selectAnim);
   outlineBtn.onclick = () => setPluginSetting("outline", !M.S.outline);
@@ -390,11 +392,11 @@ export function buildUI() {
   };
 
   mainRow.append(toggle, linkMode, anim, dragBtn, settingsBtn, debug, closeBtn, handle);
-  debugRow.append(overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn);
+  debugRow.append(overlayBtn, flowBtn, densityBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, recordBtn, durBtn);
   box.append(mainRow, dragModeRow, debugRow);
   M.barRefs = {
     toggle, linkMode, anim, vueToggle, workerBtn, pauseWorkerBtn, escalateBtn, dragBtn, dragModeRow, dragModeButtons, debug, debugRow,
-    overlayBtn, flowBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn,
+    overlayBtn, flowBtn, densityBtn, hoverBtn, selectBtn, outlineBtn, cornerBtn,
     recordBtn, durBtn, setActive,
   };
   profiler.onChange = refreshBar;
@@ -426,15 +428,77 @@ export function buildUI() {
   });
 
   document.body.appendChild(box);
+  // Measure the collapsed base width BEFORE the first refreshBar() can open
+  // an extra row (debugPanel may be persisted open): both rows are still
+  // display:none here, so offsetWidth is exactly the collapsed width. Without
+  // this, a first load with the debug panel open measures nothing and the
+  // bar does not grow leftward until every row is closed once.
+  if (box.offsetWidth > 0) M._barBaseW = box.offsetWidth;
   refreshBar();
 }
 
 // ---------------------------------------------------- hover tracking
 
+// Graph-space pointer position, or null when the pointer is outside the
+// canvas element.
+function pointerGraphPos(canvas) {
+  if (!M.mouseClient || !canvas?.ds) return null;
+  const el = canvas.canvas;
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  if (
+    M.mouseClient.x < rect.left ||
+    M.mouseClient.x > rect.right ||
+    M.mouseClient.y < rect.top ||
+    M.mouseClient.y > rect.bottom
+  )
+    return null;
+  const scale = canvas.ds.scale || 1;
+  return {
+    gx: (M.mouseClient.x - rect.left) / scale - canvas.ds.offset[0],
+    gy: (M.mouseClient.y - rect.top) / scale - canvas.ds.offset[1],
+    scale,
+  };
+}
+
+function nodeAtPoint(canvas, p) {
+  const nodes = canvas.graph?._nodes || [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const r = nodeRect(nodes[i]);
+    if (p.gx >= r.x && p.gx <= r.x + r.w && p.gy >= r.y && p.gy <= r.y + r.h)
+      return nodes[i];
+  }
+  return null;
+}
+
+// Slot-label hover: pointer over an input/output name or dot on the node
+// under the cursor. Returns an array of connected link ids, or null when no
+// linked slot is under the pointer (callers then fall back to link/node
+// hover).
+function hoverSlotLinkIdsAt(canvas) {
+  const p = pointerGraphPos(canvas);
+  if (!p) return null;
+  const node = canvas.node_over || nodeAtPoint(canvas, p);
+  if (!node) return null;
+  return slotLinkIdsAt(node, p.gx, p.gy);
+}
+
+// Single-link hover: pointer directly over a link's drawn path. Tolerance is
+// screen-relative (~9px) converted to graph units, min 3. Uses the routed set
+// from the last drawn frame (M.routeResults) — exactly what is on screen.
+function hoverLinkIdAt(canvas) {
+  const p = pointerGraphPos(canvas);
+  if (!p) return null;
+  const tol = Math.max(3, 9 / p.scale);
+  return linkIdAtPoint(M.routeResults || [], p.gx, p.gy, tol);
+}
+
 // Track pointer at document level (works above DOM widget overlays like
 // text areas) and repaint when the hovered node changes.
 export function watchHover() {
   let lastHover = null;
+  let lastHoverLink = null;
+  let lastHoverSlotKey = null;
   document.addEventListener(
     "pointermove",
     (ev) => {
@@ -442,7 +506,25 @@ export function watchHover() {
       if (!M.S.enabled || !M.S.hoverAnim) return;
       const canvas = app.canvas;
       if (!canvas) return;
-      const cur = drawHoverNodeId(canvas);
+      // Slot-label hover takes priority over link hover and node hover:
+      // pointing at an input/output name or dot animates/thickens only that
+      // slot's links. Skipped during a node drag, like link hover.
+      const slotIds = M._nodeDragActive ? null : hoverSlotLinkIdsAt(canvas);
+      const slotKey = slotIds ? slotIds.join(",") : null;
+      if (slotKey !== lastHoverSlotKey) {
+        lastHoverSlotKey = slotKey;
+        M._hoverSlotLinkIds = slotIds ? new Set(slotIds) : null;
+        canvas.setDirty(true, true);
+      }
+      // Single-link hover: pointing directly at a link animates/thickens just
+      // that link. Suppressed while a slot hover is active.
+      const curLink = slotIds || M._nodeDragActive ? null : hoverLinkIdAt(canvas);
+      if (curLink !== lastHoverLink) {
+        lastHoverLink = curLink;
+        M._hoverLinkId = curLink;
+        canvas.setDirty(true, true);
+      }
+      const cur = slotIds || curLink !== null ? null : drawHoverNodeId(canvas);
       if (cur !== lastHover) {
         lastHover = cur;
         canvas.setDirty(true, true);
@@ -459,25 +541,7 @@ export function watchHover() {
 // we don't want.  The ~20-line function is small enough to duplicate.)
 function drawHoverNodeId(canvas) {
   if (canvas.node_over) return canvas.node_over.id;
-  if (!M.mouseClient || !canvas?.ds) return null;
-  const el = canvas.canvas;
-  if (!el) return null;
-  const rect = el.getBoundingClientRect();
-  if (
-    M.mouseClient.x < rect.left ||
-    M.mouseClient.x > rect.right ||
-    M.mouseClient.y < rect.top ||
-    M.mouseClient.y > rect.bottom
-  )
-    return null;
-  const scale = canvas.ds.scale || 1;
-  const gx = (M.mouseClient.x - rect.left) / scale - canvas.ds.offset[0];
-  const gy = (M.mouseClient.y - rect.top) / scale - canvas.ds.offset[1];
-  const nodes = canvas.graph?._nodes || [];
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const r = nodeRect(nodes[i]);
-    if (gx >= r.x && gx <= r.x + r.w && gy >= r.y && gy <= r.y + r.h)
-      return nodes[i].id;
-  }
-  return null;
+  const p = pointerGraphPos(canvas);
+  if (!p) return null;
+  return nodeAtPoint(canvas, p)?.id ?? null;
 }

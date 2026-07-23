@@ -275,32 +275,6 @@ class LinkRouterProfiler {
       this.addEvent({ kind: "slow-link-frame", phase: frame.phase, durationMs: frame.drawMs });
     if (this._currentFrame === frame) this._currentFrame = null;
   }
-
-  reportText() {
-    return this.lastReport ? JSON.stringify(this.lastReport, null, 2) : "";
-  }
-
-  async copyLastReport() {
-    const text = this.reportText();
-    if (!text) return false;
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {}
-    try {
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      const ok = document.execCommand("copy");
-      area.remove();
-      return ok;
-    } catch {
-      return false;
-    }
-  }
 }
 
 export const profiler = new LinkRouterProfiler();

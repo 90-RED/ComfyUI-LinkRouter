@@ -7,6 +7,19 @@
 import { OrthoRouter } from "./router.js";
 import { app } from "../../scripts/app.js";
 
+// Defaults for the persisted floating-bar state (single source of truth —
+// used both for the merge base and the corrupt-storage fallback).
+const BAR_STATE_DEFAULTS = {
+  debug: false,
+  debugPanel: false,
+  lastFlowMode: "animated",
+  lastCornerMode: "per-line",
+  lastManualDragMode: "freeze-others",
+  recordSeconds: 30,
+  btnX: null,
+  btnY: null,
+};
+
 export const M = {
   // --- localStorage key ---
   LS_KEY: "linkrouter.state",
@@ -15,29 +28,11 @@ export const M = {
   barState: (() => {
     try {
       return Object.assign(
-        {
-          debug: false,
-          debugPanel: false,
-          lastFlowMode: "animated",
-          lastCornerMode: "per-line",
-          lastManualDragMode: "freeze-others",
-          recordSeconds: 30,
-          btnX: null,
-          btnY: null,
-        },
+        { ...BAR_STATE_DEFAULTS },
         JSON.parse(localStorage.getItem("linkrouter.state") || "{}"),
       );
     } catch {
-      return {
-        debug: false,
-        debugPanel: false,
-        lastFlowMode: "animated",
-        lastCornerMode: "per-line",
-        lastManualDragMode: "freeze-others",
-        recordSeconds: 30,
-        btnX: null,
-        btnY: null,
-      };
+      return { ...BAR_STATE_DEFAULTS };
     }
   })(),
   saveBarState() {
@@ -87,7 +82,6 @@ export const M = {
   _dragPauseRevealQueue: [], // [{linkId, cached}] worker-computed, awaiting per-frame reveal
   _dragInterruptedBatch: false,
   _lastDragSettle: null,
-  _lastDragMode: "none",
   _pointerDown: false,
   _nodeDragActive: false,
 
@@ -98,6 +92,7 @@ export const M = {
 
   // --- overlay animation layer ---
   _animLinks: [], // [{cached, color, alpha}] rebuilt by each drawAll
+  _animGapScale: 1, // adaptive marker-density gap multiplier (draw.js)
   _overlayCanvas: null,
   _overlayCtx: null,
   _overlayFailed: false,
@@ -107,14 +102,20 @@ export const M = {
   _worker: null,      // Worker instance (owned by worker-client.js)
   _workerFailed: false,
   _workerJobRev: 0,   // bumped on every dispatch/cancel; stale results die
-  _dragPauseWorker: null, // { jobRev, jobsById } held-pause queue dispatched to worker
+  _dragPauseWorker: null, // { jobRev, jobsById, graph, entries } held-pause queue dispatched to worker
 
   // --- hover tracking ---
   mouseClient: null, // {x, y} in client space
+  _hoverLinkId: null, // link id under the pointer (single-link hover; ui.js)
+  _hoverSlotLinkIds: null, // Set of link ids from the slot label/dot under the pointer (ui.js)
 
   // --- floating bar DOM refs ---
   uiBox: null,   // DOM element
   barRefs: null, // floating-bar controls used by refreshBar()
+  _barBaseW: null, // collapsed-bar pixel width; anchors left-growth (ui.js)
+
+  // --- failsafe notice (draw.js) ---
+  routeFailsafeReason: null, // set when drawAll disabled the plugin mid-session
 
   // --- pure helpers (depend only on M.S) ---
 
@@ -132,6 +133,12 @@ export const M = {
     if (this.routeBatchRaf) {
       const cancel = globalThis.cancelAnimationFrame || globalThis.clearTimeout;
       cancel?.(this.routeBatchRaf);
+    }
+    // A pending drag-settle belongs to the old router state: cancel the
+    // timer itself, not just the flag, so finishSettle cannot fire later.
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
     }
     this.router = new OrthoRouter({
       margin: this.currentMargin(),
@@ -153,6 +160,7 @@ export const M = {
     this._dragAdaptiveMode = null;
     this._dragHeavyActive = null;
     this._dragLastFastSig = "";
+    this._dragMovedIds = null;
     this._dragHiddenLinkIds.clear();
     this._dragAffectedLinkIds.clear();
     this._dragPauseActive = false;

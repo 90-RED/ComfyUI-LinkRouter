@@ -4,7 +4,7 @@ import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
 import { routeAll, nodeRect } from "./routing.js";
 import { profiler } from "./profiler.js";
-import { hoverDrawItems } from "./draw-policy.js";
+import { hoverDrawItems, animDensityScale } from "./draw-policy.js";
 
 // --- color helpers ---
 
@@ -241,7 +241,9 @@ function markerPath(ctx, style, x, y, ang, s) {
 function drawFlow(ctx, cached, t, baseColor, alpha, staticArrows = false) {
   const color =
     M.S.animColorUse && M.S.animColor ? M.S.animColor : darken(baseColor, 0.3);
-  const gap = Math.max(10, +M.S.animGap || 36);
+  // Adaptive density: drawAll recomputes the scale each frame from the number
+  // of animating links; rAF overlay redraws read the same M field.
+  const gap = Math.max(10, (+M.S.animGap || 36) * (M._animGapScale || 1));
   const speed = +M.S.animSpeed || 60;
   const size = +M.S.animSize || 5;
   const style = staticArrows ? "arrow" : M.S.animStyle;
@@ -465,18 +467,57 @@ function hoverNodeId(canvas) {
 
 // --- main draw hook ---
 
+// The routing failsafe disables the plugin for the rest of the session.
+// Tell the user visibly (frontend toast when available) and flag the
+// floating-bar toggle until the plugin is re-enabled — a silent console.warn
+// used to leave the canvas looking "mysteriously native".
+function notifyRouteFailsafe(err) {
+  const reason = String(err?.message || err || "unknown error");
+  M.routeFailsafeReason = reason;
+  console.warn(
+    "[LinkRouter] routing failed — plugin disabled for this session, " +
+      "falling back to the native renderer. Cause:",
+    reason,
+  );
+  try {
+    const toast = app.extensionManager?.toast;
+    if (toast?.add) {
+      toast.add({
+        severity: "error",
+        summary: "LinkRouter disabled",
+        detail:
+          "Routing failed (" + reason + ") — native renderer active for this session.",
+        life: 10000,
+      });
+    }
+  } catch {}
+  // Immediate UI marker (refreshBar keeps it via M.routeFailsafeReason).
+  try {
+    const btn = M.barRefs?.toggle;
+    if (btn) {
+      btn.style.background = "#a33";
+      btn.title = "LinkRouter disabled: " + reason + "\nClick to re-enable.";
+    }
+  } catch {}
+}
+
 export function drawAll(canvas, ctx) {
   const graph = canvas.graph;
   if (!graph) return;
   // Guard: router not ready yet (settings may still be loading)
   if (!M.router) return false;
+  // Mirror the native drawConnections contract (frontend 1.45.21
+  // LGraphCanvas.ts:5977): the clickable-link set is rebuilt every frame.
+  // Without this, link stroke clicking, the centre-marker menu, and link
+  // tooltips stay dead while the plugin owns drawConnections.
+  canvas.renderedPaths?.clear?.();
   const profileFrame = profiler.beginFrame(canvas);
   let routed;
   try {
     routed = routeAll(graph);
   } catch (err) {
-    console.warn("[LinkRouter] routing failed, falling back", err?.message || err);
     M.S.enabled = false;
+    notifyRouteFailsafe(err);
     profiler.endFrame(profileFrame, { fallback: true });
     return false;
   }
@@ -485,14 +526,51 @@ export function drawAll(canvas, ctx) {
     return false;
   }
 
-  const selIds = new Set(Object.keys(canvas.selected_nodes || {}).map(Number));
-  const hovId = M.S.hoverAnim ? hoverNodeId(canvas) : null;
-  const hoverId = hovId !== null && !selIds.has(hovId) ? hovId : null;
+  const selRaw = canvas.selected_nodes;
+  // Frontend 1.47 made NodeId a runtime string ("12"); older builds use
+  // numbers (12). Object keys are always strings, so normalise BOTH sides to
+  // string instead of Number()-casting the keys — Number("…") on a string
+  // NodeId made every selection lookup silently miss after the 1.47 update.
+  const selIds = new Set(
+    (selRaw instanceof Map ? [...selRaw.keys()] : Object.keys(selRaw || {})).map(String),
+  );
+  const hovLinkId = M.S.hoverAnim ? M._hoverLinkId : null;
+  const hovSlotIds = M.S.hoverAnim ? M._hoverSlotLinkIds : null;
+  // Slot-label hover (pointer on an input/output name or dot) wins over link
+  // hover and node hover: only that slot's links animate/thicken this frame.
+  const hovId =
+    M.S.hoverAnim && hovLinkId === null && !hovSlotIds ? hoverNodeId(canvas) : null;
+  const hoverId = hovId !== null && !selIds.has(String(hovId)) ? hovId : null;
   const hasSel = M.S.selectHighlight && selIds.size > 0;
   const isDragging = M._nodeDragActive;
-  const related = (link) => selIds.has(link.origin_id) || selIds.has(link.target_id);
+  // Slot-label hover also narrows a selection: while the pointer is on a slot
+  // label/dot, the highlight set shrinks to just that slot's links (other
+  // links stay dimmed), and returns to the full selection on leave.
+  const related = hovSlotIds
+    ? (link) => hovSlotIds.has(link.id)
+    : (link) =>
+        selIds.has(String(link.origin_id)) || selIds.has(String(link.target_id));
   const hovered = (link) =>
-    hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId);
+    link.id === hovLinkId ||
+    (!!hovSlotIds && hovSlotIds.has(link.id)) ||
+    (hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId));
+  // Adaptive marker density: count this frame's animating links once (cheap
+  // predicate pass, no geometry) and scale the marker gap accordingly.
+  M._animGapScale = animDensityScale(
+    M.S.flowMode === "none"
+      ? 0
+      : routed.reduce(
+          (n, { entry }) =>
+            n +
+            (((hasSel && related(entry.link)) && M.S.selectAnim) ||
+            hovered(entry.link)
+              ? 1
+              : 0),
+          0,
+        ),
+    +M.S.animAdaptiveThreshold || 10,
+    M.S.animAdaptive !== false,
+  );
   const animOK = M.animEnabledNow();
 
   // Overlay mode: animated markers are collected during the main pass and
@@ -526,7 +604,7 @@ export function drawAll(canvas, ctx) {
 
   const cull = cullRectFor(canvas);
   const batches = !hasSel ? staticBatches(canvas, routed, cull) : null;
-  const drawItems = hoverDrawItems(routed, hoverId, !!batches);
+  const drawItems = hoverDrawItems(routed, hoverId, !!batches, hovLinkId, hovSlotIds);
   if (batches) {
     const w = +M.S.lineWidth || 3;
     if (wantOutline) {
@@ -540,6 +618,21 @@ export function drawAll(canvas, ctx) {
       ctx.strokeStyle = color;
       ctx.stroke(path);
       strokeCalls++;
+    }
+    // Batch mode merges many links into one Path2D per colour, so there is no
+    // exact per-link Path2D to hand to litegraph hit-testing (a merged path
+    // would cross-hit every link in the batch). Batch links therefore join
+    // renderedPaths with their centre (_pos) only — centre marker, link menu
+    // and tooltip keep working; stroke-level hit-testing falls back to the
+    // frontend's layout-store spatial index where it has data. Links drawn
+    // individually below do get their exact .path assigned.
+    for (const { entry, cached } of routed) {
+      const link = entry.link;
+      const pts = cached.pts;
+      const mid = pts[Math.floor(pts.length / 2)];
+      link._pos && ((link._pos[0] = mid.x), (link._pos[1] = mid.y));
+      if (cull && boundsOutside(linkBounds(cached), cull)) continue;
+      canvas.renderedPaths?.add?.(link);
     }
   }
   for (const { entry, cached } of drawItems) {
@@ -561,7 +654,9 @@ export function drawAll(canvas, ctx) {
     if (alpha <= 0.01) continue;
 
     ctx.globalAlpha = alpha;
-    const w = (+M.S.lineWidth || 3) * (isSel ? +M.S.selectBoost || 1.35 : 1);
+    // Hovered links (node-hover or single-link hover) get the same width
+    // boost as selected ones — shared selectBoost multiplier on purpose.
+    const w = (+M.S.lineWidth || 3) * (isSel || isHov ? +M.S.selectBoost || 1.35 : 1);
     const color = linkColor(canvas, link);
 
     if (wantOutline) {
@@ -574,6 +669,14 @@ export function drawAll(canvas, ctx) {
     ctx.lineWidth = w;
     strokeCachedPath(ctx, cached);
     strokeCalls++;
+    // Per-link stroke: register the link and hand litegraph the exact Path2D
+    // just stroked (graph coordinates — the same space litegraphLinkAdapter
+    // stores in linkSegment.path; processMouseDown hit-tests it via
+    // ctx.isPointInStroke(path, graphX*dpi, graphY*dpi)). cachedCanvasPath
+    // reuses the stroke path, so no extra Path2D is built for this.
+    canvas.renderedPaths?.add?.(link);
+    const hitPath = cachedCanvasPath(cached);
+    if (hitPath) link.path = hitPath;
 
     if (!lowQ && ((isSel && M.S.selectAnim) || isHov)) {
       if (M.S.flowMode === "animated" && animOK) {

@@ -1,20 +1,24 @@
 // worker-client.js — main-thread transport for the router worker.
 //
 // Owns the Worker instance, the job revision counter (stale results are
-// discarded by rev), and the failure watchdog. Any failure (construction,
-// runtime error, unresponsive) permanently falls back to main-thread
-// routing for the session — the sync path in routing.js is always intact.
+// discarded by rev), and the failure watchdog. Fatal failures (construction,
+// runtime error, unresponsive stable batch, repeated batch errors)
+// permanently fall back to main-thread routing for the session — the sync
+// path in routing.js is always intact. A single failed batch only degrades
+// that batch to the main thread (see worker-policy.js).
 //
 // routing.js injects its handlers via initWorkerClient() so this module
 // never needs to import routing.js (no import cycle).
 
 import { M } from "./state.js";
+import { watchdogTimeoutAction, workerErrorAction } from "./worker-policy.js";
 
 const WATCHDOG_MS = 3000;
 
 let worker = null;
 let watchdog = 0;
-let handlers = null; // { onResult(msg), onDone(jobRev), onFailed() }
+let handlers = null; // { onResult(msg), onDone(jobRev), onFailed(), onBatchError(msg), onPauseTimeout() }
+let consecutiveBatchErrors = 0; // backstop: N in a row -> failWorker
 
 export function initWorkerClient(h) {
   handlers = h;
@@ -60,8 +64,15 @@ function failWorker(reason) {
 function armWatchdog(jobRev) {
   clearTimeout(watchdog);
   watchdog = setTimeout(() => {
-    if (M._workerJobRev === jobRev && M.routeBatch?.worker)
-      failWorker("worker unresponsive");
+    const action = watchdogTimeoutAction({
+      revMatches: M._workerJobRev === jobRev,
+      stableWorkerBatch: !!M.routeBatch?.worker,
+      pauseWorkerBatch: !!M._dragPauseWorker,
+    });
+    if (action === "fail") failWorker("worker unresponsive");
+    // Held-pause batches are not fatal: routing.js drops the batch and lets
+    // the per-frame main-thread pause drain take over.
+    else if (action === "drop-pause") handlers?.onPauseTimeout?.(jobRev);
   }, WATCHDOG_MS);
 }
 
@@ -69,14 +80,28 @@ function handleMessage(msg) {
   if (!msg) return;
   if (msg.type === "result") {
     if (msg.jobRev !== M._workerJobRev) return; // stale job
+    consecutiveBatchErrors = 0; // any progress proves the worker is alive
     armWatchdog(msg.jobRev);
     handlers?.onResult?.(msg);
   } else if (msg.type === "done") {
     if (msg.jobRev !== M._workerJobRev) return;
+    consecutiveBatchErrors = 0;
     clearTimeout(watchdog);
     handlers?.onDone?.(msg.jobRev);
   } else if (msg.type === "error") {
-    failWorker("worker reported: " + msg.message);
+    const action = workerErrorAction(
+      msg.jobRev,
+      M._workerJobRev,
+      consecutiveBatchErrors,
+    );
+    if (action === "ignore") return; // late error from a cancelled batch
+    if (action === "fail") {
+      failWorker("worker reported repeated batch errors: " + msg.message);
+      return;
+    }
+    consecutiveBatchErrors++;
+    clearTimeout(watchdog); // the batch is dead; stop waiting on it
+    handlers?.onBatchError?.(msg);
   }
 }
 
