@@ -20,6 +20,12 @@ Links automatically route around nodes instead of through them. Animated flow ma
 
 ## Installation
 
+### Via ComfyUI Manager
+
+Search for **LinkRouter** in ComfyUI Manager and click **Install**.
+
+### Manual
+
 ```bash
 cd ComfyUI/custom_nodes/
 git clone https://github.com/90-RED/ComfyUI-LinkRouter
