@@ -536,6 +536,7 @@ export function drawAll(canvas, ctx) {
   );
   const hovLinkId = M.S.hoverAnim ? M._hoverLinkId : null;
   const hovSlotIds = M.S.hoverAnim ? M._hoverSlotLinkIds : null;
+  const hovSlotNodeId = M.S.hoverAnim ? M._hoverSlotNodeId : null;
   // Slot-label hover (pointer on an input/output name or dot) wins over link
   // hover and node hover: only that slot's links animate/thicken this frame.
   const hovId =
@@ -543,17 +544,33 @@ export function drawAll(canvas, ctx) {
   const hoverId = hovId !== null && !selIds.has(String(hovId)) ? hovId : null;
   const hasSel = M.S.selectHighlight && selIds.size > 0;
   const isDragging = M._nodeDragActive;
-  // Slot-label hover also narrows a selection: while the pointer is on a slot
-  // label/dot, the highlight set shrinks to just that slot's links (other
-  // links stay dimmed), and returns to the full selection on leave.
-  const related = hovSlotIds
-    ? (link) => hovSlotIds.has(link.id)
-    : (link) =>
-        selIds.has(String(link.origin_id)) || selIds.has(String(link.target_id));
+  const related = (link) =>
+    selIds.has(String(link.origin_id)) || selIds.has(String(link.target_id));
+  const isSlotLink = (link) => !!hovSlotIds && hovSlotIds.has(link.id);
+  // Slot-label hover on a SELECTED node narrows that node's highlight to the
+  // slot's links: its other related links lose the select boost/animation but
+  // keep FULL alpha (never dimmed). Selections on other nodes are untouched,
+  // and slot hover on an unselected node leaves every selection alone.
+  const slotNodeKey =
+    hovSlotIds &&
+    hovSlotNodeId !== null &&
+    hovSlotNodeId !== undefined &&
+    selIds.has(String(hovSlotNodeId))
+      ? String(hovSlotNodeId)
+      : null;
+  const demotedSel = (link) =>
+    !!slotNodeKey &&
+    !isSlotLink(link) &&
+    (String(link.origin_id) === slotNodeKey || String(link.target_id) === slotNodeKey);
   const hovered = (link) =>
     link.id === hovLinkId ||
-    (!!hovSlotIds && hovSlotIds.has(link.id)) ||
+    isSlotLink(link) ||
     (hoverId !== null && (link.origin_id === hoverId || link.target_id === hoverId));
+  // While any hover target is active (slot label, single link, or an
+  // unselected node), selection ANIMATION pauses — selected links keep their
+  // width boost and full alpha, but only the hovered links animate.
+  const hovAny = hovLinkId !== null || !!hovSlotIds || hoverId !== null;
+  const selAnim = M.S.selectAnim && !hovAny;
   // Adaptive marker density: count this frame's animating links once (cheap
   // predicate pass, no geometry) and scale the marker gap accordingly.
   M._animGapScale = animDensityScale(
@@ -562,7 +579,7 @@ export function drawAll(canvas, ctx) {
       : routed.reduce(
           (n, { entry }) =>
             n +
-            (((hasSel && related(entry.link)) && M.S.selectAnim) ||
+            (((hasSel && related(entry.link) && !demotedSel(entry.link)) && selAnim) ||
             hovered(entry.link)
               ? 1
               : 0),
@@ -641,10 +658,12 @@ export function drawAll(canvas, ctx) {
     const mid = pts[Math.floor(pts.length / 2)];
     link._pos && ((link._pos[0] = mid.x), (link._pos[1] = mid.y));
     if (cull && boundsOutside(linkBounds(cached), cull)) continue;
-    const isSel = hasSel && related(link);
+    const isSel = hasSel && related(link) && !demotedSel(link);
     const isHov = M.S.hoverAnim && hovered(link);
     let alpha = 1;
-    if (hasSel && !isSel) {
+    // Hovered links and slot-demoted selected links keep full alpha — only
+    // truly unrelated links dim while a selection is active.
+    if (hasSel && !isSel && !isHov && !demotedSel(link)) {
       // During drag, use a separate (less aggressive) dim value
       // so you can still see the canvas layout while dragging.
       alpha = isDragging && M.S.dragDimAlpha > 0
@@ -678,7 +697,7 @@ export function drawAll(canvas, ctx) {
     const hitPath = cachedCanvasPath(cached);
     if (hitPath) link.path = hitPath;
 
-    if (!lowQ && ((isSel && M.S.selectAnim) || isHov)) {
+    if (!lowQ && ((isSel && selAnim) || isHov)) {
       if (M.S.flowMode === "animated" && animOK) {
         animOn = true;
         if (useOverlay) M._animLinks.push({ cached, color, alpha });

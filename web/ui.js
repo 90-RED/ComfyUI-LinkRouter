@@ -472,15 +472,16 @@ function nodeAtPoint(canvas, p) {
 }
 
 // Slot-label hover: pointer over an input/output name or dot on the node
-// under the cursor. Returns an array of connected link ids, or null when no
-// linked slot is under the pointer (callers then fall back to link/node
-// hover).
+// under the cursor. Returns { ids, nodeId } for the connected links, or null
+// when no linked slot is under the pointer (callers then fall back to
+// link/node hover).
 function hoverSlotLinkIdsAt(canvas) {
   const p = pointerGraphPos(canvas);
   if (!p) return null;
   const node = canvas.node_over || nodeAtPoint(canvas, p);
   if (!node) return null;
-  return slotLinkIdsAt(node, p.gx, p.gy);
+  const ids = slotLinkIdsAt(node, p.gx, p.gy);
+  return ids ? { ids, nodeId: node.id } : null;
 }
 
 // Single-link hover: pointer directly over a link's drawn path. Tolerance is
@@ -509,22 +510,23 @@ export function watchHover() {
       // Slot-label hover takes priority over link hover and node hover:
       // pointing at an input/output name or dot animates/thickens only that
       // slot's links. Skipped during a node drag, like link hover.
-      const slotIds = M._nodeDragActive ? null : hoverSlotLinkIdsAt(canvas);
-      const slotKey = slotIds ? slotIds.join(",") : null;
+      const slotHit = M._nodeDragActive ? null : hoverSlotLinkIdsAt(canvas);
+      const slotKey = slotHit ? String(slotHit.nodeId) + ":" + slotHit.ids.join(",") : null;
       if (slotKey !== lastHoverSlotKey) {
         lastHoverSlotKey = slotKey;
-        M._hoverSlotLinkIds = slotIds ? new Set(slotIds) : null;
+        M._hoverSlotLinkIds = slotHit ? new Set(slotHit.ids) : null;
+        M._hoverSlotNodeId = slotHit ? slotHit.nodeId : null;
         canvas.setDirty(true, true);
       }
       // Single-link hover: pointing directly at a link animates/thickens just
       // that link. Suppressed while a slot hover is active.
-      const curLink = slotIds || M._nodeDragActive ? null : hoverLinkIdAt(canvas);
+      const curLink = slotHit || M._nodeDragActive ? null : hoverLinkIdAt(canvas);
       if (curLink !== lastHoverLink) {
         lastHoverLink = curLink;
         M._hoverLinkId = curLink;
         canvas.setDirty(true, true);
       }
-      const cur = slotIds || curLink !== null ? null : drawHoverNodeId(canvas);
+      const cur = slotHit || curLink !== null ? null : drawHoverNodeId(canvas);
       if (cur !== lastHover) {
         lastHover = cur;
         canvas.setDirty(true, true);

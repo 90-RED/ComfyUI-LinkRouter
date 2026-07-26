@@ -108,6 +108,7 @@ export const M = {
   mouseClient: null, // {x, y} in client space
   _hoverLinkId: null, // link id under the pointer (single-link hover; ui.js)
   _hoverSlotLinkIds: null, // Set of link ids from the slot label/dot under the pointer (ui.js)
+  _hoverSlotNodeId: null, // id of the node owning the hovered slot (ui.js)
 
   // --- floating bar DOM refs ---
   uiBox: null,   // DOM element
