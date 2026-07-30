@@ -13,6 +13,33 @@ export function progressiveItemLimit(total, percent) {
   return Math.max(1, Math.ceil(total * pct / 100));
 }
 
+// Spare-time budget for one progressive reveal slice: the frame interval
+// minus the measured draw cost and a safety margin, clamped to [minMs, maxMs]
+// so a slice never starves the frame (min) nor blows past it (max) — the
+// no-dropped-frames constraint is structural, not tuned. Without a valid
+// draw/frame measurement the fixed fallback applies (first frames behave
+// exactly like the old fixed budget).
+export function adaptiveBudgetMs({
+  frameIntervalMs,
+  drawMsP95,
+  minMs = 6,
+  maxMs = 14,
+  safetyMs = 2,
+  fallbackMs = 12,
+}) {
+  if (
+    !Number.isFinite(frameIntervalMs) ||
+    frameIntervalMs <= 0 ||
+    !Number.isFinite(drawMsP95) ||
+    drawMsP95 < 0
+  )
+    return fallbackMs;
+  return Math.min(
+    maxMs,
+    Math.max(minMs, frameIntervalMs - drawMsP95 - safetyMs),
+  );
+}
+
 export function processRouteSlice(batch, routeOne, options = {}) {
   const now = options.now || (() => performance.now());
   const maxItems = options.maxItems ?? Infinity;

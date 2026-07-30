@@ -200,10 +200,16 @@ const SETTINGS = {
   ],
   routeBatchPercent: [
     "LinkRouter.Routing.RouteBatchPercent",
-    "Gradual reveal: % of links per frame (lower = smoother, higher = faster)",
+    "Gradual reveal: % of links per frame (main-thread fallback, when background worker is off)",
     "slider",
     10,
     { min: 2, max: 100, step: 1 },
+  ],
+  adaptiveRevealPacing: [
+    "LinkRouter.Routing.AdaptiveRevealPacing",
+    "Adaptive reveal pacing (fit each reveal batch into spare frame time, no dropped frames)",
+    "boolean",
+    true,
   ],
   workerRouting: [
     "LinkRouter.Routing.WorkerRouting",

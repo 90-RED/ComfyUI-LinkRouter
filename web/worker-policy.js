@@ -38,3 +38,38 @@ export function watchdogTimeoutAction({
   if (pauseWorkerBatch) return "drop-pause";
   return "ignore";
 }
+
+// Worker prewarm (Phase D1). A tiny synthetic batch is posted right after
+// worker creation so the module load and the OrthoRouter JIT/build path are
+// warm before the first real batch. It uses a reserved NEGATIVE jobRev:
+// real revs start at 0 and only increase (dispatch/cancel/resetRouter), so
+// the existing stale-rev drop in handleMessage discards every warmup
+// result/done/error — no watchdog, no failWorker, no pathCache writes, and
+// no risk of staling a user batch.
+export const WARMUP_JOB_REV = -1;
+
+// Two nodes with a clear straight corridor, one exact (weight 1) job pair —
+// the same code path a real stable batch exercises. Kept dependency-free so
+// node tests can feed it straight into router-worker-core's engine.
+export function buildWorkerWarmupPayload(margin = 16, bendPenalty = 40) {
+  const pts = [
+    100, 50, // out
+    100, 50, // bodyOut
+    116, 50, // stubOut
+    384, 50, // stubIn
+    400, 50, // bodyIn
+    400, 50, // inp
+  ];
+  const job = (id) => ({ id, endsKey: "warmup", opts: null, oldPts: null, pts });
+  return {
+    type: "route",
+    jobRev: WARMUP_JOB_REV,
+    graphRev: "warmup",
+    configKey: "warmup",
+    margin,
+    bendPenalty,
+    rects: new Float64Array([0, 0, 100, 100, 400, 0, 100, 100]),
+    terminals: new Float64Array([116, 50, 384, 50, 100, 50, 400, 50]),
+    jobs: [job(1), job(2)],
+  };
+}

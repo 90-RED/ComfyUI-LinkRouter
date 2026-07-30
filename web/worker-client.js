@@ -11,7 +11,11 @@
 // never needs to import routing.js (no import cycle).
 
 import { M } from "./state.js";
-import { watchdogTimeoutAction, workerErrorAction } from "./worker-policy.js";
+import {
+  buildWorkerWarmupPayload,
+  watchdogTimeoutAction,
+  workerErrorAction,
+} from "./worker-policy.js";
 
 const WATCHDOG_MS = 3000;
 
@@ -127,4 +131,27 @@ export function cancelWorkerBatch() {
   try {
     worker?.postMessage({ type: "cancel" });
   } catch {}
+}
+
+// Prewarm the worker at startup: construct it (async module fetch/compile)
+// and post a tiny synthetic batch so the OrthoRouter JIT is warm before the
+// first real batch. Warmup messages carry the reserved negative WARMUP_JOB_REV
+// (worker-policy.js), so handleMessage drops them via the normal stale-rev
+// check — the watchdog is never armed and pathCache is never touched.
+// Skipped when a real batch may already be in flight: the worker's
+// newest-route-wins pump would otherwise supersede it.
+export function prewarmWorker() {
+  if (!workerRoutingUsable()) return false;
+  if (M.routeBatch?.worker || M._dragPauseWorker) return false;
+  const w = ensureWorker();
+  if (!w) return false;
+  try {
+    w.postMessage(buildWorkerWarmupPayload());
+    return true;
+  } catch (e) {
+    // A failed prewarm must not failWorker (that would disable worker routing
+    // for the whole session); the first real dispatch retries anyway.
+    console.warn("[LinkRouter] worker prewarm skipped:", e?.message || e);
+    return false;
+  }
 }

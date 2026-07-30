@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  WARMUP_JOB_REV,
+  buildWorkerWarmupPayload,
   watchdogTimeoutAction,
   workerErrorAction,
 } from "../web/worker-policy.js";
@@ -78,4 +80,18 @@ test("no live batch at timeout: nothing to do", () => {
     }),
     "ignore",
   );
+});
+
+test("worker warmup payload uses reserved negative jobRev and tiny jobs", () => {
+  assert.equal(WARMUP_JOB_REV, -1);
+  assert.ok(WARMUP_JOB_REV < 0);
+  const payload = buildWorkerWarmupPayload();
+  assert.equal(payload.type, "route");
+  assert.equal(payload.jobRev, WARMUP_JOB_REV);
+  assert.ok(payload.jobs.length >= 1 && payload.jobs.length <= 2);
+  assert.equal(payload.rects.length % 4, 0);
+  assert.ok(payload.rects.length / 4 >= 2);
+  // Warmup errors must not kill the worker: rev never matches live (≥0).
+  assert.equal(workerErrorAction(WARMUP_JOB_REV, 0, 0), "ignore");
+  assert.equal(workerErrorAction(WARMUP_JOB_REV, 5, 2), "ignore");
 });

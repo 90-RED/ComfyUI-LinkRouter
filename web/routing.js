@@ -11,8 +11,10 @@ import { stretchPathPure } from "./stretch.js";
 import { profiler } from "./profiler.js";
 import {
   orderHeldRouteCandidates,
+  orderRouteCandidates,
   pathBounds,
   pauseRevealCount,
+  shouldForceGraphRebuildAfterSettle,
   shouldFreezeHiddenModeLink,
   shouldQueueIdleCleanup,
   shouldRacePauseLink,
@@ -30,6 +32,7 @@ import {
   updateRouteCost,
 } from "./adaptive-policy.js";
 import {
+  adaptiveBudgetMs,
   orderedRouteResults,
   processRouteSlice,
   progressiveItemLimit,
@@ -469,6 +472,15 @@ function refreshGraph(graph, linkEntries, rectCache, deferBuild = false) {
       if (hadStale) {
         M.routeFastSig = "";
       }
+      if (shouldForceGraphRebuildAfterSettle(hadStale)) {
+        // layoutSignature truncates coords (x|0), so the final sub-pixel
+        // position may leave graphSig unchanged while the OVG terminals no
+        // longer match the fractional endpoints (idxOf misses → A* pops 0 →
+        // every route fails). Force the next refreshGraph to rebuild with
+        // the current endpoints; deferred worker builds stay deferred and
+        // are forced fresh by ensureMainRouterFresh when routing needs it.
+        M.graphSig = "";
+      }
       // Redraw even when all routes remain valid: unrelated selected links
       // switch from drag opacity back to the normal selected opacity.
       app.canvas?.setDirty(false, true);
@@ -517,6 +529,20 @@ function predictedRouteCost(linkIds) {
 }
 
 const PROGRESSIVE_BUDGET_MS = 12;
+
+// Per-slice budget for main-thread progressive reveal. Adaptive (default):
+// spare frame time after drawing, clamped to [6, 14]ms by adaptiveBudgetMs;
+// the draw/frame EMAs come from draw.js every frame, so this works without
+// the opt-in profiler. Setting off: the fixed 12ms budget. Worker batches
+// are message-driven and never read this.
+function progressiveBudgetMs() {
+  if (M.S.adaptiveRevealPacing === false) return PROGRESSIVE_BUDGET_MS;
+  return adaptiveBudgetMs({
+    frameIntervalMs: M._frameIntervalMsEma,
+    drawMsP95: M._drawMsEma,
+    fallbackMs: PROGRESSIVE_BUDGET_MS,
+  });
+}
 
 function cancelProgressiveBatch() {
   clearWorkerRescue();
@@ -863,6 +889,13 @@ initWorkerClient({
       // The worker already attempted its own sticky stretch before failing.
       batch.routeFailures++;
       rememberRouteFailure(msg.id, job.endsKey, job.ep);
+      // Prefer a wrong-looking path over a vanishing link: keep the last
+      // legal pts on screen (old ends key retained so a later frame still
+      // re-routes after the failure backoff).
+      const prev = M.pathCache.get(msg.id);
+      if (prev?.pts) {
+        batch.resultsById.set(msg.id, { entry: job.entry, cached: prev });
+      }
     }
     scheduleProgressiveBatch(); // throttled repaint with the new partial set
     armWorkerRescue(batch); // progress: push the rescue deadline out
@@ -1034,15 +1067,19 @@ function executeRouteJob(batch, job) {
     // Degrade gracefully: keep the last legal path on screen, stretched
     // to the current endpoints, instead of making the link vanish.
     // stretchPath validates that no unexpected node body is crossed.
-    const stickyPts = stretchPath(
-      M.pathCache.get(job.entry.link.id)?.pts,
-      job.ep,
-    );
+    const prev = M.pathCache.get(job.entry.link.id);
+    const stickyPts = stretchPath(prev?.pts, job.ep);
     if (stickyPts) {
       const sticky = { ends: job.endsKey, sticky: true };
       setCachedPath(sticky, stickyPts);
       M.pathCache.set(job.entry.link.id, sticky);
       return { result: { entry: job.entry, cached: sticky }, elapsed };
+    }
+    // Last resort: prefer a wrong-looking path over a vanishing link. Emit
+    // the previous legal pts untouched, keeping their old ends key so the
+    // link is still re-routed once the failure backoff elapses.
+    if (prev?.pts) {
+      return { result: { entry: job.entry, cached: prev }, elapsed };
     }
     return { result: null, elapsed };
   }
@@ -1070,7 +1107,7 @@ function continueStableRoutes(batch, profileStarted) {
     : Infinity;
   const slice = processRouteSlice(batch, routeOne, {
     maxItems,
-    budgetMs: batch.progressive ? PROGRESSIVE_BUDGET_MS : Infinity,
+    budgetMs: batch.progressive ? progressiveBudgetMs() : Infinity,
   });
   const results = orderedRouteResults(batch.entries, batch.resultsById);
   const profile = batch.firstFrame ? batch.profile : { graphRebuilt: false };
@@ -1151,11 +1188,33 @@ function prepareStableRoutes(graph, fastSig, entries, rectCache, dirty, profileS
           setCachedPath(sticky, stickyPts);
           M.pathCache.set(entry.link.id, sticky);
           resultsById.set(entry.link.id, { entry, cached: sticky });
+        } else if (cached?.pts) {
+          // Stretch failed too: prefer the stale path over a vanishing link.
+          resultsById.set(entry.link.id, { entry, cached });
         }
         continue;
       }
       jobs.push({ entry, ep, endsKey });
     } else if (cached?.pts) resultsById.set(entry.link.id, { entry, cached });
+  }
+
+  // Viewport-first job order: progressive slices and streamed worker results
+  // appear where the user is looking first. Bounds come from the cached path
+  // when present, else the endpoint bbox. orderedRouteResults rebuilds the
+  // output from entries, so reordering jobs never changes the emitted order.
+  if (jobs.length > 1) {
+    const viewport = currentViewportRect();
+    const ordered = orderRouteCandidates(
+      jobs.map((job) => ({
+        job,
+        bounds:
+          pathBounds(M.pathCache.get(job.entry.link.id)?.pts) ||
+          failureBounds(job.ep),
+      })),
+      viewport,
+    );
+    jobs.length = 0;
+    for (const item of ordered) jobs.push(item.job);
   }
 
   const progressive = shouldProgressivelyRoute(false, forceSync, jobs.length);
@@ -1689,7 +1748,10 @@ export function routeAll(graph) {
         !pauseRoute &&
         shouldSkipFailedRoute(e.link.id, endsKey, collisionRects || dirty._rects)
       ) {
-        finishPauseRoute(false);
+        // Backoff means "do not re-route yet", not "show nothing": keep the
+        // last legal (stale) path on screen if we have one.
+        finishPauseRoute(!!cached?.pts, cached);
+        if (cached?.pts) results.push({ entry: e, cached });
         continue;
       }
       reroutedLinks++;
@@ -1733,7 +1795,14 @@ export function routeAll(graph) {
       // Never replace that with a fallback which cuts through a node.
       if (!pts) {
         rememberRouteFailure(e.link.id, endsKey, ep);
-        finishPauseRoute(false);
+        if (cached?.pts) {
+          // Prefer the last legal (now stale) path over a vanishing link;
+          // endsMoved stays true so routing retries on the next frames.
+          finishPauseRoute(true, cached);
+          results.push({ entry: e, cached });
+        } else {
+          finishPauseRoute(false);
+        }
         continue;
       }
       cached = { ends: endsKey, sticky };

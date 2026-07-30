@@ -62,6 +62,11 @@ export const M = {
   routeCostByLink: new Map(),
   routeCostByLinkMT: new Map(), // main-thread-measured costs only (pause race gate)
   routeCostAverage: NaN,
+  // Frame pacing EMAs (draw.js): feed the adaptive progressive slice budget.
+  // NaN until measured — the budget helper falls back to the fixed 12ms then.
+  _drawMsEma: NaN,
+  _frameIntervalMsEma: NaN,
+  _lastFrameEndedAt: 0,
   prevRects: new Map(),
   pathCache: new Map(),   // linkId -> {ends, pts, sticky, segs, total}
   failedRoutes: new Map(), // linkId -> {ends, fails, retryAt, bounds}

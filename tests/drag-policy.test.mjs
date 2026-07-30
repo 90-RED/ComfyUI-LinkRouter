@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 
 import {
   orderHeldRouteCandidates,
+  orderRouteCandidates,
   pathBounds,
   pauseRevealCount,
+  shouldForceGraphRebuildAfterSettle,
   shouldFreezeHiddenModeLink,
   shouldQueueIdleCleanup,
   shouldRacePauseLink,
@@ -32,6 +34,24 @@ test("held reroutes prioritize self, viewport, then expand outward", () => {
   assert.deepEqual(pathBounds([{ x: 5, y: 9 }, { x: -2, y: 20 }]), {
     x: -2, y: 9, x2: 5, y2: 20,
   });
+});
+
+test("stable route candidates prioritize viewport then distance", () => {
+  const viewport = { x: 0, y: 0, x2: 100, y2: 100 };
+  const ordered = orderRouteCandidates(
+    [
+      { id: "far", bounds: { x: 300, y: 0, x2: 320, y2: 20 } },
+      { id: "visible-b", bounds: { x: 50, y: 50, x2: 70, y2: 70 } },
+      { id: "visible-a", bounds: { x: 10, y: 10, x2: 30, y2: 30 } },
+      { id: "near", bounds: { x: 120, y: 0, x2: 140, y2: 20 } },
+    ],
+    viewport,
+  );
+  // visible first (stable original index among visibles), then near, then far
+  assert.deepEqual(
+    ordered.map((item) => item.id),
+    ["visible-b", "visible-a", "near", "far"],
+  );
 });
 
 test("a held direct link bypasses the unrelated-link freeze branch", () => {
@@ -150,4 +170,21 @@ test("held-pause race only takes predicted-cheap links", () => {
   // averages mis-predicted 19-49ms routes as cheap).
   assert.equal(shouldRacePauseLink(undefined, Infinity, 10), false);
   assert.equal(shouldRacePauseLink(3, Infinity, 10), true);
+});
+
+// Regression guard for "line vanishes after drag release" (profiler capture
+// LinkRouter_20260730-094654.json: settle frame had routeFailures=7 with
+// aStarPops=0 — layoutSignature truncates node coords with x|0, so a drag
+// ending at a sub-pixel offset kept the stale OVG and every endpoint lookup
+// missed). After a settle that invalidated any path, the next refreshGraph
+// must rebuild the graph even when the signature is unchanged. Profiler
+// regression condition: the first post-settle route frame must show
+// graphRebuilt=true and must NOT show routeFailures>0 together with
+// aStarPops=0; failed links must keep their last legal pts on screen
+// (prefer a wrong-looking path over a vanishing link).
+test("settle with stale paths forces a graph rebuild", () => {
+  assert.equal(shouldForceGraphRebuildAfterSettle(true), true);
+  // Nothing invalidated → keep the cheap signature comparison.
+  assert.equal(shouldForceGraphRebuildAfterSettle(false), false);
+  assert.equal(shouldForceGraphRebuildAfterSettle(undefined), false);
 });

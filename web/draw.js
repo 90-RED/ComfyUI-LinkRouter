@@ -467,6 +467,13 @@ function hoverNodeId(canvas) {
 
 // --- main draw hook ---
 
+// Exponential moving average that ignores invalid samples and seeds itself
+// from the first valid one (NaN until then).
+function emaSample(prev, sample, alpha = 0.2) {
+  if (!Number.isFinite(sample) || sample < 0) return prev;
+  return Number.isFinite(prev) ? prev + alpha * (sample - prev) : sample;
+}
+
 // The routing failsafe disables the plugin for the rest of the session.
 // Tell the user visibly (frontend toast when available) and flag the
 // floating-bar toggle until the plugin is re-enabled — a silent console.warn
@@ -525,6 +532,9 @@ export function drawAll(canvas, ctx) {
     profiler.endFrame(profileFrame, { fallback: true });
     return false;
   }
+  // Routing is done for this frame; the remaining drawAll work is the pure
+  // draw cost that the adaptive progressive budget subtracts from the frame.
+  const routeEndedAt = performance.now();
 
   const selRaw = canvas.selected_nodes;
   // Frontend 1.47 made NodeId a runtime string ("12"); older builds use
@@ -728,5 +738,16 @@ export function drawAll(canvas, ctx) {
     else clearOverlay();
   }
   profiler.endFrame(profileFrame, { links: routed.length, strokeCalls, batched: !!batches });
+  // Frame pacing EMAs for the adaptive progressive budget (routing.js):
+  // updated every frame, independent of the opt-in profiler. Draw time is
+  // measured after routeAll so the routing slice itself is not double
+  // counted as draw cost.
+  const frameEndedAt = performance.now();
+  M._drawMsEma = emaSample(M._drawMsEma, frameEndedAt - routeEndedAt);
+  M._frameIntervalMsEma = emaSample(
+    M._frameIntervalMsEma,
+    M._lastFrameEndedAt ? frameEndedAt - M._lastFrameEndedAt : NaN,
+  );
+  M._lastFrameEndedAt = frameEndedAt;
   return true;
 }

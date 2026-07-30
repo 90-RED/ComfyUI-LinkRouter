@@ -13,6 +13,7 @@ import { registerSettings, setRefreshBar } from "./settings.js";
 import { drawAll } from "./draw.js";
 import { buildUI, refreshBar, watchHover, linksHidden } from "./ui.js";
 import { cancelDragPauseWorker } from "./routing.js";
+import { prewarmWorker } from "./worker-client.js";
 
 // Wire the refresh-bar callback (settings.js => ui.js without circular import)
 setRefreshBar(refreshBar);
@@ -44,6 +45,10 @@ app.registerExtension({
     buildUI();
     watchHover();
     watchExecution();
+    // Settings are loaded by now: spin up the background worker and warm its
+    // router JIT with a tiny synthetic batch (no-op when worker routing is
+    // off/unavailable). See prewarmWorker in worker-client.js.
+    prewarmWorker();
     // Capture-phase tracking still sees gestures captured by Nodes 2.0.
     const beginPointer = () => {
       // A new gesture orphans the previous gesture's in-flight pause batch:

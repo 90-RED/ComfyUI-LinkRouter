@@ -44,6 +44,15 @@ export function shouldQueueIdleCleanup(effectiveMode, affected, primary, hasCach
   );
 }
 
+// After a drag-settle that invalidated paths, the next frame must rebuild
+// the OVG even when layoutSignature is unchanged: the signature truncates
+// node coords (x|0), so a drag ending at a sub-pixel offset keeps the old
+// graph while the fractional endpoints no longer match any terminal (idxOf
+// misses, A* pops 0, every route fails and the link vanishes).
+export function shouldForceGraphRebuildAfterSettle(hadStale) {
+  return !!hadStale;
+}
+
 export function pathBounds(points) {
   if (!points?.length) return null;
   let x = Infinity, y = Infinity, x2 = -Infinity, y2 = -Infinity;
@@ -97,16 +106,19 @@ export function shouldRacePauseLink(costMs, fallbackMs, maxMs) {
   return (costMs === undefined ? fallbackMs : costMs) < maxMs;
 }
 
-// Freeze this order when a held pause begins: direct links first, then links
-// visible in the current viewport, then off-screen links expanding outward.
-export function orderHeldRouteCandidates(candidates, viewport) {
+// Shared viewport-first ordering: candidates are bucketed by priority tier,
+// then by distance from the viewport, with the original index as the final
+// tiebreak (stable within a tier). directOf marks candidates that always
+// sort first (held-pause direct links); stable batches pass none.
+function orderByViewportPriority(candidates, viewport, directOf) {
   return candidates
     .map((candidate, index) => {
+      const direct = directOf(candidate);
       const visible = intersects(candidate.bounds, viewport);
       return {
-        ...candidate,
-        _priority: candidate.direct ? 0 : visible ? 1 : 2,
-        _distance: candidate.direct ? 0 : distanceFromViewport(candidate.bounds, viewport),
+        candidate,
+        _priority: direct ? 0 : visible ? 1 : 2,
+        _distance: direct ? 0 : distanceFromViewport(candidate.bounds, viewport),
         _index: index,
       };
     })
@@ -115,5 +127,20 @@ export function orderHeldRouteCandidates(candidates, viewport) {
       a._distance - b._distance ||
       a._index - b._index
     )
-    .map(({ _priority, _distance, _index, ...candidate }) => candidate);
+    .map((item) => item.candidate);
+}
+
+// Freeze this order when a held pause begins: direct links first, then links
+// visible in the current viewport, then off-screen links expanding outward.
+export function orderHeldRouteCandidates(candidates, viewport) {
+  return orderByViewportPriority(candidates, viewport, (c) => c.direct);
+}
+
+// Stable (non-drag) route jobs: links visible in the current viewport first,
+// then off-screen links expanding outward, so progressive slices and worker
+// results appear where the user is looking. Final results are rebuilt from
+// the entries order (orderedRouteResults), so reordering jobs never changes
+// the emitted id sequence.
+export function orderRouteCandidates(candidates, viewport) {
+  return orderByViewportPriority(candidates, viewport, () => false);
 }
