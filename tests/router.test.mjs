@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   DIR,
   OrthoRouter,
+  nodeBodyRectFromWH,
   pathCrossesRects,
   stretchedPathCrossesUnexpectedNode,
 } from "../web/router.js";
@@ -35,6 +36,48 @@ test("sticky drag paths allow only their own endpoint bodies", () => {
 
   assert.equal(stretchedPathCrossesUnexpectedNode(clearDetour, rects, 0, 2), false);
   assert.equal(stretchedPathCrossesUnexpectedNode(throughThirdNode, rects, 0, 2), true);
+});
+
+// Contract test for the drag-hysteresis call site (routing.js dragPathStillClear):
+// nodeRect yields {x, y, w, h}; the crossing check reads x2/y2. The conversion
+// must happen at the call site or the check silently passes everything.
+test("nodeBodyRectFromWH converts nodeRect shape to x2/y2 crossing rects", () => {
+  const body = nodeBodyRectFromWH({ x: 450, y: 100, w: 200, h: 100 });
+  assert.deepEqual(body, { x: 450, y: 100, x2: 650, y2: 200 });
+  // Non-finite inputs degrade to finite zeros instead of poisoning comparisons.
+  const fallback = nodeBodyRectFromWH({ x: NaN, y: undefined, w: null, h: Infinity });
+  assert.ok(
+    Number.isFinite(fallback.x) && Number.isFinite(fallback.y) &&
+      Number.isFinite(fallback.x2) && Number.isFinite(fallback.y2),
+  );
+});
+
+test("drag hysteresis crossing check requires the x2/y2 rect shape", () => {
+  // The dragged node body sits right on the link's horizontal segment.
+  const pts = [
+    { x: 300, y: 130 },
+    { x: 316, y: 130 },
+    { x: 884, y: 130 },
+    { x: 900, y: 130 },
+  ];
+  const source = { x: 100, y: 100, w: 200, h: 100 };
+  const target = { x: 900, y: 100, w: 200, h: 100 };
+  const draggedWH = { x: 450, y: 100, w: 200, h: 100 };
+
+  const withConversion = [source, target, draggedWH].map(nodeBodyRectFromWH);
+  // Body crosses the path → hysteresis must report "not clear" (force re-route).
+  assert.equal(stretchedPathCrossesUnexpectedNode(pts, withConversion, 0, 1), true);
+
+  // Regression lock: the raw w/h shape misses the very same crossing —
+  // this is exactly what made live avoidance never fire.
+  const rawShape = [source, target, draggedWH].map((r) => ({ ...r }));
+  assert.equal(stretchedPathCrossesUnexpectedNode(pts, rawShape, 0, 1), false);
+
+  // Margin-zone proximity without body contact stays "clear" (anti-flicker).
+  const nearMiss = [source, target, { x: 450, y: 240, w: 200, h: 100 }].map(
+    nodeBodyRectFromWH,
+  );
+  assert.equal(stretchedPathCrossesUnexpectedNode(pts, nearMiss, 0, 1), false);
 });
 
 test("A* treats every node body as a hard obstacle", () => {

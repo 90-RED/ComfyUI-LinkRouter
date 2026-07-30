@@ -862,6 +862,18 @@ function dedupePoints(pts) {
   return out;
 }
 
+// Convert a nodeRect-shaped rect ({x, y, w, h}) to the {x, y, x2, y2} shape
+// segmentCrossesRect consumes. Feeding the w/h shape in directly makes every
+// x2/y2 comparison NaN-false, silently disabling the crossing check.
+export function nodeBodyRectFromWH(r) {
+  const f = (v) => (Number.isFinite(+v) ? +v : 0);
+  const x = f(r.x),
+    y = f(r.y),
+    w = f(r.w),
+    h = f(r.h);
+  return { x, y, x2: x + w, y2: y + h };
+}
+
 // True only when an orthogonal segment enters a rectangle's open interior.
 // Travelling exactly along a node edge remains legal for endpoint escapes.
 function segmentCrossesRect(a, b, r) {

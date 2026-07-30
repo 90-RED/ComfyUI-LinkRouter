@@ -6,7 +6,7 @@
 
 import { app } from "../../scripts/app.js";
 import { M } from "./state.js";
-import { stretchedPathCrossesUnexpectedNode } from "./router.js";
+import { nodeBodyRectFromWH, stretchedPathCrossesUnexpectedNode } from "./router.js";
 import { stretchPathPure } from "./stretch.js";
 import { profiler } from "./profiler.js";
 import {
@@ -1531,7 +1531,11 @@ export function routeAll(graph) {
   const dragPathStillClear = (entry, pts) => {
     if (!hysteresisRects) {
       hysteresisNodes = graph._nodes || [];
-      hysteresisRects = hysteresisNodes.map((n) => cachedNodeRect(n, rectCache));
+      // nodeRect is {x, y, w, h}; the crossing check reads x2/y2 — convert,
+      // or the comparison goes NaN-false and every path counts as "clear".
+      hysteresisRects = hysteresisNodes.map((n) =>
+        nodeBodyRectFromWH(cachedNodeRect(n, rectCache)),
+      );
     }
     return !stretchedPathCrossesUnexpectedNode(
       pts,

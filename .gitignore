@@ -3,3 +3,7 @@ __pycache__/
 *.pyo
 .DS_Store
 Thumbs.db
+
+# Local agent notes (keep out of GitHub)
+進度.md
+**/進度.md
